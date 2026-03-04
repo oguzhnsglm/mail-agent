@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  newsletter-agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: ai-newsletter-agent
+    environment:
+      - PYTHONPATH=/app
+    env_file:
+      - ../.env
+    volumes:
+      - ../logs:/app/logs
+      - ../credentials.json:/app/credentials.json:ro
+      - ../token.json:/app/token.json
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    command: ["python", "main.py", "--mode", "schedule"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  newsletter-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: ai-newsletter-api
+    environment:
+      - PYTHONPATH=/app
+    env_file:
+      - ../.env
+    volumes:
+      - ../logs:/app/logs
+      - ../credentials.json:/app/credentials.json:ro
+      - ../token.json:/app/token.json
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+    command: ["python", "-m", "uvicorn", "api.fastapi_server:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  default:
+    name: newsletter-network

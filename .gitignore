@@ -1,0 +1,41 @@
+# Credentials
+credentials.json
+
+# Python
+*.pyc
+__pycache__/
+*.py[cod]
+*$py.class
+*.pickle
+*.pkl
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
