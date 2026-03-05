@@ -95,7 +95,10 @@ class NewsletterAgents:
 --- SOSYAL MEDYA VERİLERİ ---
 {social_text}
 
-COK ONEMLI KURAL: Asagidaki sosyal medya paylasimlari arasinda '{topic}' konusuyla DOGRUDAN veya DOLAYLI iliskisi OLMAYAN paylasimlari TAMAMEN ATLA. Ornegin; genel pazar analizi, farkli sektorlerden haberler, farkli ulkelerin ic meseleleri gibi konuyla baglantiyi kuramayacagin icerikler varsa bunlari DAHIL ETME. Sadece '{topic}' ile alakali olanlari asagidaki formatta yaz.
+COK ONEMLI KURALLAR:
+1. ILISKILENDIRME: Asagidaki sosyal medya paylasimlari arasinda '{topic}' konusuyla DOGRUDAN veya DOLAYLI iliskisi OLMAYAN paylasimlari TAMAMEN ATLA. Ornegin; genel pazar analizi, farkli sektorlerden haberler, farkli ulkelerin ic meseleleri, genel sirket tanitimi (takipci sayisi, is ilanlari vb.) gibi konuyla baglantiyi kuramayacagin icerikler varsa bunlari DAHIL ETME. Sadece '{topic}' ile ilgili SOMUT bir bilgi, haber veya gelisme iceren paylasimlar dahil edilmeli.
+2. GUNCELLIK: Tarihi bugunden 30 gundan eski olan veya tarihi belirsiz olan paylasimlar varsa bunlari DAHIL ETME. Sadece yakin tarihli paylasimlar dahil edilmeli.
+3. TEKRAR: Ayni icerigi tekrarlayan veya birbirine cok benzeyen paylasimlar varsa sadece en detaylisini dahil et, digerlerini atla.
 
 Sosyal medya paylasimlarini asagidaki formatta yaz:
 ## Sosyal Medya Yansimlari
@@ -112,6 +115,11 @@ Sosyal medya paylasimlarini asagidaki formatta yaz:
 Tarih: {_today_tr()}
 
 Aşağıda web crawler ve sosyal medya tarayıcısı tarafından çekilmiş, ham (raw) haber verileri ve kaynak linkleri bulunuyor. Senden tek istenen bu verileri aşağıda belirtilen kesin E-POSTA FORMATI ile Türkçe olarak temizlemen ve listelemen. ASLA içerikte olmayan bir şeyi uydurma. ASLA giriş (Merhaba, bültene hoşgeldiniz vb.) veya kapanış (İyi günler, saygılar vb.) mesajı yazma.
+
+ONEMLI FILTRELEME KURALLARI:
+- '{topic}' ile DOGRUDAN iliskisi OLMAYAN haberleri TAMAMEN ATLA. Genel ekonomi haberleri, farkli sirketlerle ilgili haberler veya konuyla baglanti kuramadigin icerikleri DAHIL ETME.
+- Tarihi cok eski olan (30 günden fazla) haberleri DAHIL ETME.
+- Ayni haberi tekrarlama, birbirine benzer haberleri birlestir.
 
 --- WEB HABER VERİLERİ ---
 {web_text if web_text else "(Web haberi bulunamadı)"}

@@ -625,6 +625,9 @@ class WebCrawler:
         except Exception as e:
             logger.error(f"Social media search failed for {topic}: {e}")
 
+        # Tarih filtresi: çok eski içerikleri ele
+        all_articles = self._filter_by_recency(all_articles)
+
         web_count = len([a for a in all_articles if a.get('source_type') != 'social_media'])
         social_count = len([a for a in all_articles if a.get('source_type') == 'social_media'])
         logger.info(f"Found {len(all_articles)} articles for {topic} (web: {web_count}, social: {social_count})")
@@ -640,6 +643,7 @@ class WebCrawler:
         # Profil sayfası mı yoksa doğrudan post mu ayırt et
         profile_items = []
         post_items = []
+        skipped_items = []
         for item in social_urls:
             url = item.get("url", "")
             # LinkedIn company sayfası
@@ -647,7 +651,13 @@ class WebCrawler:
                 profile_items.append(item)
             # Twitter/X profil veya hashtag sayfası (status/ içermeyen)
             elif re.search(r'(?:twitter\.com|x\.com)/', url) and '/status/' not in url:
-                profile_items.append(item)
+                # Twitter profil/hashtag ilişkilendirme kontrolü:
+                # URL veya başlıkta topic'in anahtar kelimelerinden biri geçiyor mu?
+                if self._is_twitter_relevant(item, topic):
+                    profile_items.append(item)
+                else:
+                    logger.info(f"[Social] Twitter profili alakasız, atlandı: {url}")
+                    skipped_items.append(item)
             else:
                 post_items.append(item)
 
@@ -695,88 +705,174 @@ class WebCrawler:
     async def _search_profile_posts(
         self, crawler, crawler_config, item: Dict, topic: str
     ) -> List[Dict]:
-        """Profil sayfası bulunduğunda, Google'da o profilin son postlarını arar.
-        LinkedIn login duvarı olduğu için doğrudan profile gitmek yerine
-        Google'dan indexed post URL'lerini bulup meta tag'lerden içerik çeker.
+        """Profil sayfası bulunduğunda, birden fazla strateji ile son postları arar:
+        1. Profil sayfasını doğrudan crawl edip post linklerini çeker
+        2. Google'da indexed post URL'lerini arar
+        3. DuckDuckGo'da indexed post URL'lerini arar
         """
         url = item.get("url", "")
         platform = item.get("platform", "unknown")
 
-        # Profil adını çıkar (Google araması için)
+        # Profil adını çıkar
         profile_name = ""
+        profile_slug = ""
         if 'linkedin.com/company/' in url:
             match = re.search(r'linkedin\.com/company/([^/]+)', url)
             if match:
-                profile_name = match.group(1).replace('-', ' ')
+                profile_slug = match.group(1)
+                profile_name = profile_slug.replace('-', ' ')
         elif re.search(r'(?:twitter\.com|x\.com)/(\w+)', url):
             match = re.search(r'(?:twitter\.com|x\.com)/(\w+)', url)
             if match:
-                profile_name = match.group(1)
+                slug = match.group(1)
+                # hashtag sayfası ise topic'i kullan, profil adı olarak "hashtag" anlamsız
+                if slug.lower() == 'hashtag':
+                    # x.com/hashtag/fnss -> "fnss" kısmını çıkar
+                    hash_match = re.search(r'hashtag/(\w+)', url)
+                    if hash_match:
+                        profile_slug = hash_match.group(1)
+                        profile_name = profile_slug
+                    else:
+                        return [self._social_fallback(item, topic)]
+                else:
+                    profile_slug = slug
+                    profile_name = slug
 
         if not profile_name:
             return [self._social_fallback(item, topic)]
 
-        # Google'da bu profilin son postlarını ara
-        if platform == 'linkedin':
-            search_query = f'"{profile_name}" site:linkedin.com/posts/ OR site:linkedin.com/feed/update'
-        else:
-            search_query = f'from:{profile_name} site:x.com OR site:twitter.com'
-
-        encoded_q = urllib.parse.quote_plus(search_query)
-        google_url = f"https://www.google.com/search?q={encoded_q}&tbs=qdr:w&hl=tr&gl=TR&num=5"
-
-        logger.info(f"[Social] Profil postları aranıyor: {search_query}")
-
-        result = await crawler.arun(url=google_url, config=crawler_config)
-        if not (result.success and hasattr(result, 'html') and result.html):
-            logger.warning(f"[Social] Google post araması başarısız: {profile_name}")
-            return [self._social_fallback(item, topic)]
-
-        soup = BeautifulSoup(result.html, 'html.parser')
-
-        # Google sonuçlarından post URL'lerini çıkar
         post_urls = []
         seen = set()
-        for a_tag in soup.find_all('a', href=True):
-            href = a_tag['href']
-            if '/url?q=' in href:
-                href = href.split('/url?q=')[1].split('&')[0]
-                href = urllib.parse.unquote(href)
 
-            # LinkedIn post URL'si mi?
-            is_post = False
-            if platform == 'linkedin' and re.search(r'linkedin\.com/(posts|feed/update)/', href):
-                is_post = True
-            elif platform == 'twitter' and re.search(r'(twitter\.com|x\.com)/\w+/status/\d+', href):
-                is_post = True
+        # --- Strateji 1: Profil sayfasını doğrudan crawl et ---
+        try:
+            logger.info(f"[Social] Profil sayfası crawl ediliyor: {url}")
+            profile_result = await crawler.arun(url=url, config=crawler_config)
+            if profile_result.success and hasattr(profile_result, 'html') and profile_result.html:
+                profile_soup = BeautifulSoup(profile_result.html, 'html.parser')
+                # LinkedIn profil sayfasında post linkleri bul
+                for a_tag in profile_soup.find_all('a', href=True):
+                    href = a_tag['href']
+                    if href.startswith('/'):
+                        href = f"https://www.linkedin.com{href}"
+                    is_post = False
+                    if platform == 'linkedin' and re.search(r'linkedin\.com/(posts|feed/update)/', href):
+                        is_post = True
+                    elif platform == 'twitter' and re.search(r'(twitter\.com|x\.com)/\w+/status/\d+', href):
+                        is_post = True
+                    if is_post and href not in seen:
+                        title = a_tag.get_text(strip=True)
+                        if len(title) < 10:
+                            title = f"{profile_name} paylasimi"
+                        seen.add(href)
+                        post_urls.append({"url": href, "title": title})
+                        if len(post_urls) >= 3:
+                            break
+                if post_urls:
+                    logger.info(f"[Social] Profil sayfasından {len(post_urls)} post linki bulundu")
+        except Exception as e:
+            logger.warning(f"[Social] Profil crawl hatası: {e}")
 
-            if is_post and href not in seen:
-                title = a_tag.get_text(strip=True)
-                if len(title) > 15:
-                    seen.add(href)
-                    post_urls.append({"url": href, "title": title})
-                    if len(post_urls) >= 3:
-                        break
+        # --- Strateji 2: Google'da post ara ---
+        if len(post_urls) < 3:
+            try:
+                if platform == 'linkedin':
+                    search_query = f'"{profile_name}" site:linkedin.com/posts/ OR site:linkedin.com/feed/update'
+                elif 'hashtag/' in url:
+                    # Hashtag araması: #fnss ile ilgili tweetler
+                    search_query = f'#{profile_slug} site:x.com OR site:twitter.com'
+                else:
+                    search_query = f'from:{profile_name} site:x.com OR site:twitter.com'
+
+                encoded_q = urllib.parse.quote_plus(search_query)
+                google_url = f"https://www.google.com/search?q={encoded_q}&tbs=qdr:m&hl=tr&gl=TR&num=5"
+
+                logger.info(f"[Social] Google post araması: {search_query}")
+                result = await crawler.arun(url=google_url, config=crawler_config)
+                if result.success and hasattr(result, 'html') and result.html:
+                    self._extract_post_urls_from_search(
+                        result.html, platform, post_urls, seen, max_count=3
+                    )
+            except Exception as e:
+                logger.warning(f"[Social] Google post araması hatası: {e}")
+
+        # --- Strateji 3: DuckDuckGo'da post ara ---
+        if len(post_urls) < 3:
+            try:
+                if platform == 'linkedin':
+                    ddg_query = f'{topic} site:linkedin.com/posts/{profile_slug}'
+                elif 'hashtag/' in url:
+                    ddg_query = f'{topic} #{profile_slug} site:x.com'
+                else:
+                    ddg_query = f'{topic} from:{profile_slug} site:x.com'
+
+                encoded_q = urllib.parse.quote_plus(ddg_query)
+                ddg_url = f"https://html.duckduckgo.com/html/?q={encoded_q}"
+
+                logger.info(f"[Social] DuckDuckGo post araması: {ddg_query}")
+                ddg_result = await crawler.arun(url=ddg_url, config=crawler_config)
+                if ddg_result.success and hasattr(ddg_result, 'html') and ddg_result.html:
+                    ddg_soup = BeautifulSoup(ddg_result.html, 'html.parser')
+                    for a_tag in ddg_soup.find_all('a', href=True):
+                        href = a_tag.get('href', '')
+                        if 'uddg=' in href:
+                            href = urllib.parse.unquote(href.split('uddg=')[1].split('&')[0])
+                        is_post = False
+                        if platform == 'linkedin' and re.search(r'linkedin\.com/(posts|feed/update)/', href):
+                            is_post = True
+                        elif platform == 'twitter' and re.search(r'(twitter\.com|x\.com)/\w+/status/\d+', href):
+                            is_post = True
+                        if is_post and href not in seen:
+                            title = a_tag.get_text(strip=True)
+                            if len(title) < 10:
+                                title = f"{profile_name} paylasimi"
+                            seen.add(href)
+                            post_urls.append({"url": href, "title": title})
+                            if len(post_urls) >= 3:
+                                break
+                    if post_urls:
+                        logger.info(f"[Social] DuckDuckGo'dan ek post bulundu, toplam: {len(post_urls)}")
+            except Exception as e:
+                logger.warning(f"[Social] DuckDuckGo post araması hatası: {e}")
+
+        # --- Strateji 4: Genel konu araması (Google News + LinkedIn) ---
+        if len(post_urls) < 1:
+            try:
+                if platform == 'linkedin':
+                    fallback_query = f'{topic} site:linkedin.com/posts'
+                else:
+                    fallback_query = f'{topic} site:x.com'
+                encoded_q = urllib.parse.quote_plus(fallback_query)
+                google_url = f"https://www.google.com/search?q={encoded_q}&tbs=qdr:w&hl=tr&gl=TR&num=5"
+                logger.info(f"[Social] Genel konu post araması: {fallback_query}")
+                result = await crawler.arun(url=google_url, config=crawler_config)
+                if result.success and hasattr(result, 'html') and result.html:
+                    self._extract_post_urls_from_search(
+                        result.html, platform, post_urls, seen, max_count=3
+                    )
+            except Exception as e:
+                logger.warning(f"[Social] Genel konu araması hatası: {e}")
 
         if not post_urls:
-            logger.info(f"[Social] Google'da post bulunamadı: {profile_name}")
+            logger.info(f"[Social] Hiçbir stratejide post bulunamadı: {profile_name}")
             return [self._social_fallback(item, topic)]
 
-        logger.info(f"[Social] {len(post_urls)} post URL bulundu: {profile_name}")
+        logger.info(f"[Social] Toplam {len(post_urls)} post URL bulundu: {profile_name}")
 
-        # Bulunan post URL'lerinden içerik çek (og:description meta tag)
+        # Bulunan post URL'lerinden içerik çek
         posts = []
         for post_info in post_urls:
             try:
                 post_result = await crawler.arun(url=post_info["url"], config=crawler_config)
                 if post_result.success and hasattr(post_result, 'html') and post_result.html:
                     post_content = self._extract_meta_content(post_result.html)
+                    pub_date = self._extract_social_date(post_result.html, post_info["url"]) or datetime.now().strftime("%Y-%m-%d")
                     if post_content and len(post_content) > 30:
                         posts.append({
                             "title": post_info["title"],
                             "summary": post_content,
                             "url": post_info["url"],
-                            "published_date": datetime.now().strftime("%Y-%m-%d"),
+                            "published_date": pub_date,
                             "content": post_content,
                             "topic": topic,
                             "source_type": "social_media",
@@ -801,6 +897,32 @@ class WebCrawler:
 
         return posts if posts else [self._social_fallback(item, topic)]
 
+    def _extract_post_urls_from_search(
+        self, html: str, platform: str, post_urls: list, seen: set, max_count: int = 3
+    ):
+        """Google/arama motoru HTML sonuçlarından post URL'lerini çıkarır."""
+        soup = BeautifulSoup(html, 'html.parser')
+        for a_tag in soup.find_all('a', href=True):
+            if len(post_urls) >= max_count:
+                break
+            href = a_tag['href']
+            if '/url?q=' in href:
+                href = href.split('/url?q=')[1].split('&')[0]
+                href = urllib.parse.unquote(href)
+
+            is_post = False
+            if platform == 'linkedin' and re.search(r'linkedin\.com/(posts|feed/update)/', href):
+                is_post = True
+            elif platform == 'twitter' and re.search(r'(twitter\.com|x\.com)/\w+/status/\d+', href):
+                is_post = True
+
+            if is_post and href not in seen:
+                title = a_tag.get_text(strip=True)
+                if len(title) > 15:
+                    seen.add(href)
+                    post_urls.append({"url": href, "title": title})
+                    logger.info(f"[Social] Arama'dan post bulundu: {title[:60]}")
+
     async def _fetch_post_content(
         self, crawler, crawler_config, item: Dict, topic: str
     ) -> Dict:
@@ -813,11 +935,12 @@ class WebCrawler:
             if result.success and hasattr(result, 'html') and result.html:
                 content = self._extract_meta_content(result.html)
                 if content and len(content) > 30:
+                    pub_date = self._extract_social_date(result.html, url) or item.get("date", datetime.now().strftime("%Y-%m-%d"))
                     return {
                         "title": item.get("title", topic),
                         "summary": content,
                         "url": url,
-                        "published_date": item.get("date", datetime.now().strftime("%Y-%m-%d")),
+                        "published_date": pub_date,
                         "content": content,
                         "topic": topic,
                         "source_type": "social_media",
@@ -846,6 +969,97 @@ class WebCrawler:
 
         # Markdown içerikten de deneyebiliriz
         return title_content
+
+    def _extract_social_date(self, html: str, url: str) -> str:
+        """Sosyal medya postunun tarihini çıkarır.
+        LinkedIn activity ID'den veya meta tag'lerden tarih çıkarır.
+        """
+        # Önce standart HTML tarih çıkarımını dene
+        date = self._extract_date_from_html(html)
+        if date:
+            return date
+
+        # LinkedIn activity ID'den tarih çıkar
+        # LinkedIn activity ID'leri Snowflake benzeri ID'lerdir
+        # Format: activity-{id} -> id'nin üst bitleri timestamp içerir
+        match = re.search(r'activity-(\d+)', url)
+        if match:
+            try:
+                activity_id = int(match.group(1))
+                # LinkedIn activity ID: üst 41 bit = millisaniye timestamp (epoch: 2010-01-01)
+                linkedin_epoch = 1288834974657  # LinkedIn epoch in ms
+                timestamp_ms = (activity_id >> 22) + linkedin_epoch
+                dt = datetime.fromtimestamp(timestamp_ms / 1000)
+                if abs((datetime.now() - dt).days) < 365:
+                    return dt.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        # og:title veya sayfa metninde tarih paterni ara
+        soup = BeautifulSoup(html, 'html.parser')
+        # LinkedIn bazen "X gün önce", "X hafta önce" gibi ifadeler kullanır
+        for text_el in soup.find_all(string=re.compile(r'\d+\s*(gün|hafta|saat|dakika|ay)\s*önce', re.I)):
+            try:
+                text = text_el.strip()
+                num_match = re.search(r'(\d+)\s*(gün|hafta|saat|dakika|ay)', text, re.I)
+                if num_match:
+                    num = int(num_match.group(1))
+                    unit = num_match.group(2).lower()
+                    if unit in ('saat', 'dakika'):
+                        return datetime.now().strftime("%Y-%m-%d")
+                    elif unit == 'gün':
+                        return (datetime.now() - timedelta(days=num)).strftime("%Y-%m-%d")
+                    elif unit == 'hafta':
+                        return (datetime.now() - timedelta(weeks=num)).strftime("%Y-%m-%d")
+                    elif unit == 'ay':
+                        return (datetime.now() - timedelta(days=num * 30)).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        return ""
+
+    def _is_twitter_relevant(self, item: Dict, topic: str) -> bool:
+        """Twitter profil/hashtag URL'sinin konu ile ilişkili olup olmadığını kontrol eder.
+        URL, başlık veya snippet'te topic anahtar kelimelerinden en az biri geçmeli.
+        """
+        topic_lower = topic.lower()
+        # Topic'ten anahtar kelimeler çıkar (en az 3 karakter olanlar)
+        keywords = [w for w in topic_lower.split() if len(w) >= 3]
+
+        url = item.get("url", "").lower()
+        title = item.get("title", "").lower()
+        content = item.get("content", "").lower()
+        check_text = f"{url} {title} {content}"
+
+        for kw in keywords:
+            if kw in check_text:
+                return True
+        return False
+
+    def _filter_by_recency(self, articles: List[Dict], max_age_days: int = 30) -> List[Dict]:
+        """Tarih bilgisi olan makaleleri kontrol eder, çok eski olanları eler.
+        Tarih bilgisi olmayan veya parse edilemeyen makaleler korunur.
+        """
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+        filtered = []
+        for article in articles:
+            pub_date_str = article.get("published_date", "")
+            if not pub_date_str:
+                filtered.append(article)
+                continue
+            try:
+                pub_date = dateutil.parser.parse(pub_date_str, fuzzy=True)
+                if pub_date.tzinfo:
+                    pub_date = pub_date.replace(tzinfo=None)
+                if pub_date >= cutoff:
+                    filtered.append(article)
+                else:
+                    logger.info(f"[Recency] Eski icerik elendi: {article.get('title', '')[:60]} ({pub_date_str})")
+            except Exception:
+                filtered.append(article)
+        if len(filtered) < len(articles):
+            logger.info(f"[Recency] {len(articles) - len(filtered)} eski icerik elendi, kalan: {len(filtered)}")
+        return filtered
 
     def _social_fallback(self, item: Dict, topic: str) -> Dict:
         """Sosyal medya sonucunu sadece başlık bilgisiyle article olarak döndürür."""
