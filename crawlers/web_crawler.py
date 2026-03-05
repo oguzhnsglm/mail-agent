@@ -643,7 +643,6 @@ class WebCrawler:
         # Profil sayfası mı yoksa doğrudan post mu ayırt et
         profile_items = []
         post_items = []
-        skipped_items = []
         for item in social_urls:
             url = item.get("url", "")
             # LinkedIn company sayfası
@@ -651,13 +650,7 @@ class WebCrawler:
                 profile_items.append(item)
             # Twitter/X profil veya hashtag sayfası (status/ içermeyen)
             elif re.search(r'(?:twitter\.com|x\.com)/', url) and '/status/' not in url:
-                # Twitter profil/hashtag ilişkilendirme kontrolü:
-                # URL veya başlıkta topic'in anahtar kelimelerinden biri geçiyor mu?
-                if self._is_twitter_relevant(item, topic):
-                    profile_items.append(item)
-                else:
-                    logger.info(f"[Social] Twitter profili alakasız, atlandı: {url}")
-                    skipped_items.append(item)
+                profile_items.append(item)
             else:
                 post_items.append(item)
 
@@ -724,19 +717,8 @@ class WebCrawler:
         elif re.search(r'(?:twitter\.com|x\.com)/(\w+)', url):
             match = re.search(r'(?:twitter\.com|x\.com)/(\w+)', url)
             if match:
-                slug = match.group(1)
-                # hashtag sayfası ise topic'i kullan, profil adı olarak "hashtag" anlamsız
-                if slug.lower() == 'hashtag':
-                    # x.com/hashtag/fnss -> "fnss" kısmını çıkar
-                    hash_match = re.search(r'hashtag/(\w+)', url)
-                    if hash_match:
-                        profile_slug = hash_match.group(1)
-                        profile_name = profile_slug
-                    else:
-                        return [self._social_fallback(item, topic)]
-                else:
-                    profile_slug = slug
-                    profile_name = slug
+                profile_slug = match.group(1)
+                profile_name = profile_slug
 
         if not profile_name:
             return [self._social_fallback(item, topic)]
@@ -778,9 +760,6 @@ class WebCrawler:
             try:
                 if platform == 'linkedin':
                     search_query = f'"{profile_name}" site:linkedin.com/posts/ OR site:linkedin.com/feed/update'
-                elif 'hashtag/' in url:
-                    # Hashtag araması: #fnss ile ilgili tweetler
-                    search_query = f'#{profile_slug} site:x.com OR site:twitter.com'
                 else:
                     search_query = f'from:{profile_name} site:x.com OR site:twitter.com'
 
@@ -801,8 +780,6 @@ class WebCrawler:
             try:
                 if platform == 'linkedin':
                     ddg_query = f'{topic} site:linkedin.com/posts/{profile_slug}'
-                elif 'hashtag/' in url:
-                    ddg_query = f'{topic} #{profile_slug} site:x.com'
                 else:
                     ddg_query = f'{topic} from:{profile_slug} site:x.com'
 
@@ -866,7 +843,7 @@ class WebCrawler:
                 post_result = await crawler.arun(url=post_info["url"], config=crawler_config)
                 if post_result.success and hasattr(post_result, 'html') and post_result.html:
                     post_content = self._extract_meta_content(post_result.html)
-                    pub_date = self._extract_social_date(post_result.html, post_info["url"]) or datetime.now().strftime("%Y-%m-%d")
+                    pub_date = self._extract_date_from_html(post_result.html) or datetime.now().strftime("%Y-%m-%d")
                     if post_content and len(post_content) > 30:
                         posts.append({
                             "title": post_info["title"],
@@ -935,12 +912,11 @@ class WebCrawler:
             if result.success and hasattr(result, 'html') and result.html:
                 content = self._extract_meta_content(result.html)
                 if content and len(content) > 30:
-                    pub_date = self._extract_social_date(result.html, url) or item.get("date", datetime.now().strftime("%Y-%m-%d"))
                     return {
                         "title": item.get("title", topic),
                         "summary": content,
                         "url": url,
-                        "published_date": pub_date,
+                        "published_date": item.get("date", datetime.now().strftime("%Y-%m-%d")),
                         "content": content,
                         "topic": topic,
                         "source_type": "social_media",
@@ -969,72 +945,6 @@ class WebCrawler:
 
         # Markdown içerikten de deneyebiliriz
         return title_content
-
-    def _extract_social_date(self, html: str, url: str) -> str:
-        """Sosyal medya postunun tarihini çıkarır.
-        LinkedIn activity ID'den veya meta tag'lerden tarih çıkarır.
-        """
-        # Önce standart HTML tarih çıkarımını dene
-        date = self._extract_date_from_html(html)
-        if date:
-            return date
-
-        # LinkedIn activity ID'den tarih çıkar
-        # LinkedIn activity ID'leri Snowflake benzeri ID'lerdir
-        # Format: activity-{id} -> id'nin üst bitleri timestamp içerir
-        match = re.search(r'activity-(\d+)', url)
-        if match:
-            try:
-                activity_id = int(match.group(1))
-                # LinkedIn activity ID: üst 41 bit = millisaniye timestamp (epoch: 2010-01-01)
-                linkedin_epoch = 1288834974657  # LinkedIn epoch in ms
-                timestamp_ms = (activity_id >> 22) + linkedin_epoch
-                dt = datetime.fromtimestamp(timestamp_ms / 1000)
-                if abs((datetime.now() - dt).days) < 365:
-                    return dt.strftime("%Y-%m-%d")
-            except Exception:
-                pass
-
-        # og:title veya sayfa metninde tarih paterni ara
-        soup = BeautifulSoup(html, 'html.parser')
-        # LinkedIn bazen "X gün önce", "X hafta önce" gibi ifadeler kullanır
-        for text_el in soup.find_all(string=re.compile(r'\d+\s*(gün|hafta|saat|dakika|ay)\s*önce', re.I)):
-            try:
-                text = text_el.strip()
-                num_match = re.search(r'(\d+)\s*(gün|hafta|saat|dakika|ay)', text, re.I)
-                if num_match:
-                    num = int(num_match.group(1))
-                    unit = num_match.group(2).lower()
-                    if unit in ('saat', 'dakika'):
-                        return datetime.now().strftime("%Y-%m-%d")
-                    elif unit == 'gün':
-                        return (datetime.now() - timedelta(days=num)).strftime("%Y-%m-%d")
-                    elif unit == 'hafta':
-                        return (datetime.now() - timedelta(weeks=num)).strftime("%Y-%m-%d")
-                    elif unit == 'ay':
-                        return (datetime.now() - timedelta(days=num * 30)).strftime("%Y-%m-%d")
-            except Exception:
-                pass
-
-        return ""
-
-    def _is_twitter_relevant(self, item: Dict, topic: str) -> bool:
-        """Twitter profil/hashtag URL'sinin konu ile ilişkili olup olmadığını kontrol eder.
-        URL, başlık veya snippet'te topic anahtar kelimelerinden en az biri geçmeli.
-        """
-        topic_lower = topic.lower()
-        # Topic'ten anahtar kelimeler çıkar (en az 3 karakter olanlar)
-        keywords = [w for w in topic_lower.split() if len(w) >= 3]
-
-        url = item.get("url", "").lower()
-        title = item.get("title", "").lower()
-        content = item.get("content", "").lower()
-        check_text = f"{url} {title} {content}"
-
-        for kw in keywords:
-            if kw in check_text:
-                return True
-        return False
 
     def _filter_by_recency(self, articles: List[Dict], max_age_days: int = 30) -> List[Dict]:
         """Tarih bilgisi olan makaleleri kontrol eder, çok eski olanları eler.
