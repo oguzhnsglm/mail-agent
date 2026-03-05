@@ -452,46 +452,414 @@ class WebCrawler:
         logger.info(f"Got {len(final_results)} dynamic URLs directly via Headless Browser for topic {topic}")
         return final_results
     
-    async def fetch_live_data(self, topic: str) -> List[Dict]:
-        """Main method to fetch live data for a topic using dynamic Web+News searches."""
-        logger.info(f"Fetching live data for topic: {topic}")
-        
-        all_articles = []
-        
-        # Get dynamic URLs based on search
-        search_urls = await self.search_news_urls(topic)
-        logger.info(f"Found {len(search_urls)} URLs to crawl for {topic}")
-        
-        if not search_urls:
+    async def search_social_urls(self, topic: str) -> List[Dict]:
+        """LinkedIn ve Twitter/X'te DuckDuckGo uzerinden arama yapar.
+        Birden fazla arama stratejisi ile sonuc bulmaya calisir.
+        LinkedIn oncelikli. Filtreler kaldirildi - tum sonuclar gosterilir.
+        """
+        from config import config
+        if not getattr(config, 'SOCIAL_SEARCH_ENABLED', True):
+            logger.info("[Social] SOCIAL_SEARCH_ENABLED=false, atlaniyor")
             return []
-            
-        # Crawl found URLs using Crawl4AI (or fallback)
-        crawl_tasks = []
-        for item in search_urls:
-            crawl_tasks.append(
-                self.crawl_with_crawl4ai(
-                    url=item["url"], 
-                    topic=topic,
-                    expected_date=item["date"],
-                    expected_title=item["title"]
-                )
+
+        social_results = []
+        seen = set()
+
+        # LinkedIn icin coklu strateji: en spesifikten en genise
+        platforms = [
+            {
+                "key": "linkedin",
+                "name": "LinkedIn",
+                "queries": [
+                    f"{topic} site:linkedin.com",
+                    f"{topic} linkedin",
+                ],
+                "icon": "LinkedIn",
+            },
+            {
+                "key": "twitter",
+                "name": "Twitter/X",
+                "queries": [
+                    f"{topic} site:x.com OR site:twitter.com",
+                    f"{topic} twitter",
+                ],
+                "icon": "Twitter/X",
+            },
+        ]
+
+        enabled_platforms = getattr(config, 'SOCIAL_PLATFORMS', ['linkedin', 'twitter'])
+        max_per_platform = getattr(config, 'SOCIAL_MAX_RESULTS_PER_PLATFORM', 3)
+
+        try:
+            browser_config = BrowserConfig(headless=True)
+            crawler_config = CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS,
+                page_timeout=30000,
+                magic=True,
             )
-        
-        # Execute crawling tasks concurrently
-        crawl_results = await asyncio.gather(*crawl_tasks, return_exceptions=True)
-        
-        for result in crawl_results:
-            if isinstance(result, list):
-                all_articles.extend(result)
-            elif isinstance(result, Exception):
-                logger.error(f"Crawling task failed: {str(result)}")
-        
-        # Filter articles by topic relevance and recency
-        filtered_articles = self._filter_articles(all_articles, topic)
-        
-        logger.info(f"Found {len(filtered_articles)} relevant articles for {topic}")
-        return filtered_articles
+
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                for pinfo in platforms:
+                    if pinfo["key"] not in enabled_platforms:
+                        continue
+
+                    count = 0
+                    for query in pinfo["queries"]:
+                        if count >= max_per_platform:
+                            break
+
+                        encoded = urllib.parse.quote_plus(query)
+                        ddg_url = f"https://html.duckduckgo.com/html/?q={encoded}"
+
+                        logger.info(f"[Social] === {pinfo['name']} ===")
+                        logger.info(f"[Social] Sorgu: '{query}'")
+
+                        try:
+                            ddg_result = await crawler.arun(url=ddg_url, config=crawler_config)
+                            if not (ddg_result.success and hasattr(ddg_result, 'html') and ddg_result.html):
+                                logger.warning(f"[Social] DuckDuckGo basarisiz: {pinfo['name']}")
+                                continue
+
+                            logger.info(f"[Social] HTML: {len(ddg_result.html)} karakter")
+                            soup = BeautifulSoup(ddg_result.html, 'html.parser')
+
+                            all_links = soup.find_all('a', href=True)
+                            logger.info(f"[Social] Sayfada {len(all_links)} link bulundu")
+
+                            for a_tag in all_links:
+                                if count >= max_per_platform:
+                                    break
+
+                                href = a_tag.get('href', '')
+                                title = a_tag.get_text(strip=True)
+
+                                if 'uddg=' in href:
+                                    href = urllib.parse.unquote(href.split('uddg=')[1].split('&')[0])
+
+                                if not href.startswith('http') or len(title) < 10:
+                                    continue
+                                if 'duckduckgo.com' in href:
+                                    continue
+                                if href in seen:
+                                    continue
+
+                                # Snippet'ten icerik cikar
+                                content = title
+                                date_str = datetime.now().strftime("%Y-%m-%d")
+                                parent = a_tag.find_parent(class_='result') or a_tag.find_parent(class_='web-result')
+                                if parent:
+                                    snippet_el = parent.select_one('.result__snippet')
+                                    if snippet_el:
+                                        content = snippet_el.get_text(strip=True)
+                                    date_el = parent.select_one('.result__date')
+                                    if date_el:
+                                        date_str = date_el.get_text(strip=True)
+
+                                seen.add(href)
+                                social_results.append({
+                                    "url": href,
+                                    "date": date_str,
+                                    "title": f"{pinfo['icon']}: {title}",
+                                    "platform": pinfo["key"],
+                                    "source_type": "social_media",
+                                    "content": content,
+                                })
+                                count += 1
+                                logger.info(f"[Social] [+] #{count}: '{title[:60]}' -> {href[:80]}")
+
+                        except Exception as e:
+                            logger.error(f"[Social] {pinfo['name']} hata: {e}")
+                            continue
+
+                        # Bu sorgu yeterli sonuc verdiyse digerine gecme
+                        if count >= max_per_platform:
+                            break
+
+                    logger.info(f"[Social] {pinfo['name']} toplam: {count}")
+
+        except Exception as e:
+            logger.error(f"[Social] Genel hata: {e}", exc_info=True)
+
+        logger.info(f"[Social] === Toplam sosyal medya sonucu: {len(social_results)} ===")
+        return social_results
+
+    async def fetch_live_data(self, topic: str) -> List[Dict]:
+        """Main method to fetch live data for a topic using dynamic Web+News+Social searches."""
+        logger.info(f"Fetching live data for topic: {topic}")
+
+        all_articles = []
+
+        # 1. Web haber araması (mevcut yaklaşım)
+        search_urls = await self.search_news_urls(topic)
+        logger.info(f"Found {len(search_urls)} web URLs to crawl for {topic}")
+
+        if search_urls:
+            # Crawl found URLs using Crawl4AI (or fallback)
+            crawl_tasks = []
+            for item in search_urls:
+                crawl_tasks.append(
+                    self.crawl_with_crawl4ai(
+                        url=item["url"],
+                        topic=topic,
+                        expected_date=item["date"],
+                        expected_title=item["title"]
+                    )
+                )
+
+            crawl_results = await asyncio.gather(*crawl_tasks, return_exceptions=True)
+
+            for result in crawl_results:
+                if isinstance(result, list):
+                    all_articles.extend(result)
+                elif isinstance(result, Exception):
+                    logger.error(f"Crawling task failed: {str(result)}")
+
+        # 2. Sosyal medya araması (LinkedIn + Twitter/X)
+        try:
+            social_urls = await self.search_social_urls(topic)
+            if social_urls:
+                logger.info(f"Found {len(social_urls)} social media URLs for {topic}")
+                social_articles = await self._enrich_social_results(social_urls, topic)
+                all_articles.extend(social_articles)
+                logger.info(f"Added {len(social_articles)} social media articles for {topic}")
+        except Exception as e:
+            logger.error(f"Social media search failed for {topic}: {e}")
+
+        web_count = len([a for a in all_articles if a.get('source_type') != 'social_media'])
+        social_count = len([a for a in all_articles if a.get('source_type') == 'social_media'])
+        logger.info(f"Found {len(all_articles)} articles for {topic} (web: {web_count}, social: {social_count})")
+        return all_articles
     
+    async def _enrich_social_results(self, social_urls: List[Dict], topic: str) -> List[Dict]:
+        """Sosyal medya sonuçlarını zenginleştirir.
+        Profil/company sayfası bulunduysa Google'da o profilin son postlarını arar.
+        Bulunan post URL'lerinden og:description ile içerik çeker.
+        """
+        articles = []
+
+        # Profil sayfası mı yoksa doğrudan post mu ayırt et
+        profile_items = []
+        post_items = []
+        for item in social_urls:
+            url = item.get("url", "")
+            # LinkedIn company sayfası
+            if re.search(r'linkedin\.com/company/[^/]+', url) and '/posts/' not in url and '/pulse/' not in url:
+                profile_items.append(item)
+            # Twitter/X profil veya hashtag sayfası (status/ içermeyen)
+            elif re.search(r'(?:twitter\.com|x\.com)/', url) and '/status/' not in url:
+                profile_items.append(item)
+            else:
+                post_items.append(item)
+
+        logger.info(f"[Social] {len(profile_items)} profil, {len(post_items)} dogrudan post")
+
+        try:
+            browser_config = BrowserConfig(headless=True)
+            crawler_config = CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS,
+                page_timeout=30000,
+                magic=True,
+            )
+
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                # 1. Profil sayfaları için Google'da son postları ara
+                for item in profile_items:
+                    try:
+                        posts = await self._search_profile_posts(
+                            crawler, crawler_config, item, topic
+                        )
+                        articles.extend(posts)
+                    except Exception as e:
+                        logger.error(f"[Social] Profil post arama hatası ({item.get('url')}): {e}")
+                        articles.append(self._social_fallback(item, topic))
+
+                # 2. Doğrudan post URL'lerinden içerik çek
+                for item in post_items:
+                    try:
+                        enriched = await self._fetch_post_content(
+                            crawler, crawler_config, item, topic
+                        )
+                        articles.append(enriched)
+                    except Exception as e:
+                        logger.error(f"[Social] Post içerik hatası ({item.get('url')}): {e}")
+                        articles.append(self._social_fallback(item, topic))
+
+        except Exception as e:
+            logger.error(f"[Social] Enrichment crawler hatası: {e}")
+            # Tüm sonuçları fallback olarak ekle
+            for item in profile_items + post_items:
+                articles.append(self._social_fallback(item, topic))
+
+        return articles
+
+    async def _search_profile_posts(
+        self, crawler, crawler_config, item: Dict, topic: str
+    ) -> List[Dict]:
+        """Profil sayfası bulunduğunda, Google'da o profilin son postlarını arar.
+        LinkedIn login duvarı olduğu için doğrudan profile gitmek yerine
+        Google'dan indexed post URL'lerini bulup meta tag'lerden içerik çeker.
+        """
+        url = item.get("url", "")
+        platform = item.get("platform", "unknown")
+
+        # Profil adını çıkar (Google araması için)
+        profile_name = ""
+        if 'linkedin.com/company/' in url:
+            match = re.search(r'linkedin\.com/company/([^/]+)', url)
+            if match:
+                profile_name = match.group(1).replace('-', ' ')
+        elif re.search(r'(?:twitter\.com|x\.com)/(\w+)', url):
+            match = re.search(r'(?:twitter\.com|x\.com)/(\w+)', url)
+            if match:
+                profile_name = match.group(1)
+
+        if not profile_name:
+            return [self._social_fallback(item, topic)]
+
+        # Google'da bu profilin son postlarını ara
+        if platform == 'linkedin':
+            search_query = f'"{profile_name}" site:linkedin.com/posts/ OR site:linkedin.com/feed/update'
+        else:
+            search_query = f'from:{profile_name} site:x.com OR site:twitter.com'
+
+        encoded_q = urllib.parse.quote_plus(search_query)
+        google_url = f"https://www.google.com/search?q={encoded_q}&tbs=qdr:w&hl=tr&gl=TR&num=5"
+
+        logger.info(f"[Social] Profil postları aranıyor: {search_query}")
+
+        result = await crawler.arun(url=google_url, config=crawler_config)
+        if not (result.success and hasattr(result, 'html') and result.html):
+            logger.warning(f"[Social] Google post araması başarısız: {profile_name}")
+            return [self._social_fallback(item, topic)]
+
+        soup = BeautifulSoup(result.html, 'html.parser')
+
+        # Google sonuçlarından post URL'lerini çıkar
+        post_urls = []
+        seen = set()
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href']
+            if '/url?q=' in href:
+                href = href.split('/url?q=')[1].split('&')[0]
+                href = urllib.parse.unquote(href)
+
+            # LinkedIn post URL'si mi?
+            is_post = False
+            if platform == 'linkedin' and re.search(r'linkedin\.com/(posts|feed/update)/', href):
+                is_post = True
+            elif platform == 'twitter' and re.search(r'(twitter\.com|x\.com)/\w+/status/\d+', href):
+                is_post = True
+
+            if is_post and href not in seen:
+                title = a_tag.get_text(strip=True)
+                if len(title) > 15:
+                    seen.add(href)
+                    post_urls.append({"url": href, "title": title})
+                    if len(post_urls) >= 3:
+                        break
+
+        if not post_urls:
+            logger.info(f"[Social] Google'da post bulunamadı: {profile_name}")
+            return [self._social_fallback(item, topic)]
+
+        logger.info(f"[Social] {len(post_urls)} post URL bulundu: {profile_name}")
+
+        # Bulunan post URL'lerinden içerik çek (og:description meta tag)
+        posts = []
+        for post_info in post_urls:
+            try:
+                post_result = await crawler.arun(url=post_info["url"], config=crawler_config)
+                if post_result.success and hasattr(post_result, 'html') and post_result.html:
+                    post_content = self._extract_meta_content(post_result.html)
+                    if post_content and len(post_content) > 30:
+                        posts.append({
+                            "title": post_info["title"],
+                            "summary": post_content,
+                            "url": post_info["url"],
+                            "published_date": datetime.now().strftime("%Y-%m-%d"),
+                            "content": post_content,
+                            "topic": topic,
+                            "source_type": "social_media",
+                            "platform": platform,
+                        })
+                        logger.info(f"[Social] Post içeriği çekildi: {post_info['title'][:60]}")
+                        continue
+
+                # Meta tag'den çekemediyse başlıkla ekle
+                posts.append({
+                    "title": post_info["title"],
+                    "summary": post_info["title"],
+                    "url": post_info["url"],
+                    "published_date": datetime.now().strftime("%Y-%m-%d"),
+                    "content": post_info["title"],
+                    "topic": topic,
+                    "source_type": "social_media",
+                    "platform": platform,
+                })
+            except Exception as e:
+                logger.error(f"[Social] Post içerik çekme hatası: {e}")
+
+        return posts if posts else [self._social_fallback(item, topic)]
+
+    async def _fetch_post_content(
+        self, crawler, crawler_config, item: Dict, topic: str
+    ) -> Dict:
+        """Doğrudan bir post URL'sinden içerik çeker (og:description ve markdown)."""
+        url = item.get("url", "")
+        platform = item.get("platform", "unknown")
+
+        try:
+            result = await crawler.arun(url=url, config=crawler_config)
+            if result.success and hasattr(result, 'html') and result.html:
+                content = self._extract_meta_content(result.html)
+                if content and len(content) > 30:
+                    return {
+                        "title": item.get("title", topic),
+                        "summary": content,
+                        "url": url,
+                        "published_date": item.get("date", datetime.now().strftime("%Y-%m-%d")),
+                        "content": content,
+                        "topic": topic,
+                        "source_type": "social_media",
+                        "platform": platform,
+                    }
+        except Exception as e:
+            logger.error(f"[Social] Post fetch hatası ({url}): {e}")
+
+        return self._social_fallback(item, topic)
+
+    def _extract_meta_content(self, html: str) -> str:
+        """HTML'den og:description, twitter:description veya description meta tag'ini çeker.
+        LinkedIn ve Twitter login olmadan bile bu meta tag'lerde post içeriğini verir.
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # Öncelik sırasıyla meta tag'lerden içerik çek
+        for prop in ['og:description', 'twitter:description', 'description']:
+            meta = soup.find('meta', property=prop) or soup.find('meta', attrs={'name': prop})
+            if meta and meta.get('content') and len(meta['content'].strip()) > 30:
+                return meta['content'].strip()[:3000]
+
+        # og:title da faydalı olabilir
+        og_title = soup.find('meta', property='og:title')
+        title_content = og_title['content'].strip() if og_title and og_title.get('content') else ""
+
+        # Markdown içerikten de deneyebiliriz
+        return title_content
+
+    def _social_fallback(self, item: Dict, topic: str) -> Dict:
+        """Sosyal medya sonucunu sadece başlık bilgisiyle article olarak döndürür."""
+        return {
+            "title": item.get("title", topic),
+            "summary": item.get("content", item.get("title", "")),
+            "url": item.get("url", ""),
+            "published_date": item.get("date", datetime.now().strftime("%Y-%m-%d")),
+            "content": item.get("content", item.get("title", "")),
+            "topic": topic,
+            "source_type": "social_media",
+            "platform": item.get("platform", "unknown"),
+        }
+
     def _parse_llm_extraction(self, extracted_content: str, source_url: str, topic: str) -> List[Dict]:
         """Parse LLM extracted content into article format"""
         try:

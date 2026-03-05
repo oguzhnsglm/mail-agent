@@ -41,8 +41,10 @@ class NewsletterScheduler:
             if not all_articles:
                 logger.warning("No articles found. Skipping newsletter generation.")
                 return
-            
-            logger.info(f"Total articles collected: {len(all_articles)}")
+
+            web_count = len([a for a in all_articles if a.get('source_type') != 'social_media'])
+            social_count = len([a for a in all_articles if a.get('source_type') == 'social_media'])
+            logger.info(f"Total articles collected: {len(all_articles)} (web: {web_count}, social: {social_count})")
             
             # Step 2: Process articles through agent workflow
             logger.info("Step 2: Processing articles through AI agents...")

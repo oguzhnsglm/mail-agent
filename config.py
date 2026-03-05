@@ -45,4 +45,18 @@ class Config:
     # News sources (fallback - empty, search handles everything)
     NEWS_SOURCES = []
 
+    # Social Media Search Configuration
+    # Sosyal medya aramasını açıp kapatmak için: SOCIAL_SEARCH_ENABLED=true/false
+    SOCIAL_SEARCH_ENABLED = os.getenv("SOCIAL_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes")
+    
+    # Hangi platformlarda arama yapılacak (virgülle ayırarak): twitter,linkedin
+    _social_platforms_env = os.getenv("SOCIAL_PLATFORMS", "twitter,linkedin")
+    SOCIAL_PLATFORMS: List[str] = [p.strip() for p in _social_platforms_env.split(",") if p.strip()]
+    
+    # Sosyal medya sonuçlarının zaman aralığı (gün cinsinden, Google qdr parametresi)
+    SOCIAL_SEARCH_RECENCY_DAYS = int(os.getenv("SOCIAL_SEARCH_RECENCY_DAYS", "2"))
+    
+    # Platform başına maksimum sonuç sayısı
+    SOCIAL_MAX_RESULTS_PER_PLATFORM = int(os.getenv("SOCIAL_MAX_RESULTS_PER_PLATFORM", "3"))
+
 config = Config()

@@ -57,35 +57,76 @@ class NewsletterAgents:
             state["final_newsletter"] = f"Konu: {topic}\n\nYeni bir haber bulunamadı."
             return state
 
+        # Makaleleri web ve sosyal medya olarak ayır
+        web_articles = [a for a in articles if a.get('source_type') != 'social_media']
+        social_articles = [a for a in articles if a.get('source_type') == 'social_media']
+
+        logger.info(f"Articles breakdown: {len(web_articles)} web, {len(social_articles)} social")
+
         # Format directly from raw data without LLM hallucination
-        system_message = "Sen sadece sana verilen HTML/Web metinlerini temiz, yalın bir Türkçe haber formatında düzenleyen bir asistansın. ASLA ekstra bir bilgi ekleme, yorum yapma veya giriş/çıkış cümlesi kurma."
-        
-        articles_text = ""
-        for i, article in enumerate(articles, 1):
+        system_message = f"Sen sadece sana verilen HTML/Web metinlerini temiz, yalin bir Turkce haber formatinda duzenleyen bir asistansin. ASLA ekstra bir bilgi ekleme, yorum yapma veya giris/cikis cumlesi kurma."
+
+        # Web haberleri metni
+        web_text = ""
+        for i, article in enumerate(web_articles, 1):
             url = article.get('url', 'URL Yok')
             content = article.get('content', '') or article.get('summary', '')
-            content = content[:8000] # Limit content length
+            content = content[:8000]
             title = article.get('title', f"Haber {i}")
             pub_date = article.get('published_date', '')
-            articles_text += f"\nHABER {i}:\nURL: {url}\nBAŞLIK: {title}\nTARİH: {pub_date}\nİÇERİK ÖZETİ: {content}\n---\n"
-        
+            web_text += f"\nHABER {i}:\nURL: {url}\nBAŞLIK: {title}\nTARİH: {pub_date}\nİÇERİK ÖZETİ: {content}\n---\n"
+
+        # Sosyal medya paylaşımları metni
+        social_text = ""
+        for i, article in enumerate(social_articles, 1):
+            url = article.get('url', 'URL Yok')
+            content = article.get('content', '') or article.get('summary', '')
+            content = content[:5000]
+            title = article.get('title', f"Paylaşım {i}")
+            pub_date = article.get('published_date', '')
+            platform = article.get('platform', 'sosyal medya')
+            social_text += f"\nPAYLAŞIM {i}:\nPLATFORM: {platform}\nURL: {url}\nBAŞLIK: {title}\nTARİH: {pub_date}\nİÇERİK: {content}\n---\n"
+
+        # Prompt'u oluştur
+        social_section_instruction = ""
+        if social_text:
+            social_section_instruction = f"""
+
+--- SOSYAL MEDYA VERİLERİ ---
+{social_text}
+
+COK ONEMLI KURAL: Asagidaki sosyal medya paylasimlari arasinda '{topic}' konusuyla DOGRUDAN veya DOLAYLI iliskisi OLMAYAN paylasimlari TAMAMEN ATLA. Ornegin; genel pazar analizi, farkli sektorlerden haberler, farkli ulkelerin ic meseleleri gibi konuyla baglantiyi kuramayacagin icerikler varsa bunlari DAHIL ETME. Sadece '{topic}' ile alakali olanlari asagidaki formatta yaz.
+
+Sosyal medya paylasimlarini asagidaki formatta yaz:
+## Sosyal Medya Yansimlari
+(Her paylasim icin asagidaki blogu aynen cogalt)
+### [Platform Emojisi] [Paylasim Basligi]
+**Platform:** [LinkedIn / Twitter-X]
+**Tarih:** [TARIH alanini kullan]
+**Ozet:** [Icerikteki gercek bilgileri 2-3 cumlelik kisa bir Turkce ozete cevir. Uydurma bilgi ekleme.]
+**Kaynak Linki:** [URL linkini direkt yaz]
+---
+"""
+
         prompt = f"""Bugünkü konu: {topic}
 Tarih: {_today_tr()}
 
-Aşağıda web crawler tarafından çekilmiş, ham (raw) haber verileri ve kaynak linkleri bulunuyor. Senden tek istenen bu verileri aşağıda belirtilen kesin E-POSTA FORMATI ile Türkçe olarak temizlemen ve listelemen. ASLA içerikte olmayan bir şeyi uydurma. ASLA giriş (Merhaba, bültene hoşgeldiniz vb.) veya kapanış (İyi günler, saygılar vb.) mesajı yazma.
+Aşağıda web crawler ve sosyal medya tarayıcısı tarafından çekilmiş, ham (raw) haber verileri ve kaynak linkleri bulunuyor. Senden tek istenen bu verileri aşağıda belirtilen kesin E-POSTA FORMATI ile Türkçe olarak temizlemen ve listelemen. ASLA içerikte olmayan bir şeyi uydurma. ASLA giriş (Merhaba, bültene hoşgeldiniz vb.) veya kapanış (İyi günler, saygılar vb.) mesajı yazma.
 
-VERİLER:
-{articles_text}
+--- WEB HABER VERİLERİ ---
+{web_text if web_text else "(Web haberi bulunamadı)"}
 
 İSTENEN KESİN FORMAT:
 Subject Line: [{_today_tr()} - {topic} Haberleri]
 
-(Her haber için aşağıdaki bloğu aynen çoğalt)
+## 📰 Web Haberleri
+(Her haber için aşağıdaki bloğu aynen çoğalt. Eğer web haberi yoksa bu bölümü atla.)
 ### [Haber Başlığı]
 **Tarih:** [Sana gönderilen TARİH alanını kullan. Eğer boşsa {_today_tr()} yaz.]
 **Detaylar:** [Sana gönderilen İÇERİK ÖZETİ içindeki gerçek bilgileri 3-5 cümlelik detaylı bir Türkçe haber paragrafına çevir. Uydurma bilgi ekleme. İçerikteki önemli detayları, rakamları ve isimleri mutlaka dahil et.]
 **Kaynak Linki:** [Sana gönderilen "URL" linki, hiçbir html etiketi olmadan direkt çıplak link]
 ---
+{social_section_instruction}
 """
         try:
             final_newsletter = self.llm_client.generate_completion(
