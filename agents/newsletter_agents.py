@@ -74,7 +74,8 @@ class NewsletterAgents:
             content = content[:8000]
             title = article.get('title', f"Haber {i}")
             pub_date = article.get('published_date', '')
-            web_text += f"\nHABER {i}:\nURL: {url}\nBAŞLIK: {title}\nTARİH: {pub_date}\nİÇERİK ÖZETİ: {content}\n---\n"
+            search_source = article.get('search_source', '')
+            web_text += f"\nHABER {i}:\nURL: {url}\nBAŞLIK: {title}\nTARİH: {pub_date}\nKAYNAK ARAMA MOTORU: {search_source}\nİÇERİK ÖZETİ: {content}\n---\n"
 
         # Sosyal medya paylaşımları metni
         social_text = ""
@@ -85,7 +86,8 @@ class NewsletterAgents:
             title = article.get('title', f"Paylaşım {i}")
             pub_date = article.get('published_date', '')
             platform = article.get('platform', 'sosyal medya')
-            social_text += f"\nPAYLAŞIM {i}:\nPLATFORM: {platform}\nURL: {url}\nBAŞLIK: {title}\nTARİH: {pub_date}\nİÇERİK: {content}\n---\n"
+            search_source = article.get('search_source', '')
+            social_text += f"\nPAYLAŞIM {i}:\nPLATFORM: {platform}\nURL: {url}\nBAŞLIK: {title}\nTARİH: {pub_date}\nKAYNAK ARAMA MOTORU: {search_source}\nİÇERİK: {content}\n---\n"
 
         # Prompt'u oluştur
         social_section_instruction = ""
@@ -95,10 +97,10 @@ class NewsletterAgents:
 --- SOSYAL MEDYA VERİLERİ ---
 {social_text}
 
-COK ONEMLI KURALLAR:
-1. ILISKILENDIRME: Asagidaki sosyal medya paylasimlari arasinda '{topic}' konusuyla DOGRUDAN veya DOLAYLI iliskisi OLMAYAN paylasimlari TAMAMEN ATLA. Ornegin; genel pazar analizi, farkli sektorlerden haberler, farkli ulkelerin ic meseleleri, genel sirket tanitimi (takipci sayisi, is ilanlari vb.) gibi konuyla baglantiyi kuramayacagin icerikler varsa bunlari DAHIL ETME. Sadece '{topic}' ile ilgili SOMUT bir bilgi, haber veya gelisme iceren paylasimlar dahil edilmeli.
-2. GUNCELLIK: Tarihi bugunden 30 gundan eski olan veya tarihi belirsiz olan paylasimlar varsa bunlari DAHIL ETME. Sadece yakin tarihli paylasimlar dahil edilmeli.
-3. TEKRAR: Ayni icerigi tekrarlayan veya birbirine cok benzeyen paylasimlar varsa sadece en detaylisini dahil et, digerlerini atla.
+KURALLAR:
+1. ILISKILENDIRME: '{topic}' konusuyla hicbir sekilde iliskilendirilemeyen paylasimlar (tamamen farkli sektor, tamamen farkli konu) atlanabilir. Ancak dolayli da olsa baglantiyi kurabiliyorsan dahil et. Genis yorumla — konuyla ilgili genel sektör haberleri, teknoloji gelismeleri, ilgili sirketlerin paylisimlari da dahil edilebilir.
+2. GUNCELLIK: Sadece 90 günden eski olan paylasimlar atlansin. Tarihi belirsiz olan paylasimlar DAHIL EDILSIN, tarih olarak "Tarih belirtilmemis" yaz.
+3. TEKRAR: Tamamen ayni icerigi tekrarlayan paylasimlar varsa sadece en detaylisini dahil et.
 
 Sosyal medya paylasimlarini asagidaki formatta yaz:
 ## Sosyal Medya Yansimlari
@@ -108,6 +110,7 @@ Sosyal medya paylasimlarini asagidaki formatta yaz:
 **Tarih:** [TARIH alanini kullan]
 **Ozet:** [Icerikteki gercek bilgileri 2-3 cumlelik kisa bir Turkce ozete cevir. Uydurma bilgi ekleme.]
 **Kaynak Linki:** [URL linkini direkt yaz]
+**Bulunan Arama Motoru:** [KAYNAK ARAMA MOTORU alanını aynen yaz]
 ---
 """
 
@@ -116,10 +119,10 @@ Tarih: {_today_tr()}
 
 Aşağıda web crawler ve sosyal medya tarayıcısı tarafından çekilmiş, ham (raw) haber verileri ve kaynak linkleri bulunuyor. Senden tek istenen bu verileri aşağıda belirtilen kesin E-POSTA FORMATI ile Türkçe olarak temizlemen ve listelemen. ASLA içerikte olmayan bir şeyi uydurma. ASLA giriş (Merhaba, bültene hoşgeldiniz vb.) veya kapanış (İyi günler, saygılar vb.) mesajı yazma.
 
-ONEMLI FILTRELEME KURALLARI:
-- '{topic}' ile DOGRUDAN iliskisi OLMAYAN haberleri TAMAMEN ATLA. Genel ekonomi haberleri, farkli sirketlerle ilgili haberler veya konuyla baglanti kuramadigin icerikleri DAHIL ETME.
-- Tarihi cok eski olan (30 günden fazla) haberleri DAHIL ETME.
-- Ayni haberi tekrarlama, birbirine benzer haberleri birlestir.
+FILTRELEME KURALLARI:
+- '{topic}' ile hicbir sekilde iliskilendirilemeyen haberleri atla. Ancak dolayli iliskisi olan (ayni sektor, benzer teknoloji, ilgili sirketler vb.) haberleri DAHIL ET. Genis yorumla ve mumkun oldugunca cok haberi dahil etmeye calis.
+- Sadece 90 günden eski haberleri atla. Tarihi belirsiz haberleri DAHIL ET, tarih olarak "Tarih belirtilmemis" yaz.
+- Tamamen ayni haberi tekrarlama, ama benzer haberleri ayri ayri dahil edebilirsin.
 
 --- WEB HABER VERİLERİ ---
 {web_text if web_text else "(Web haberi bulunamadı)"}
@@ -133,6 +136,7 @@ Subject Line: [{_today_tr()} - {topic} Haberleri]
 **Tarih:** [Sana gönderilen TARİH alanını kullan. Eğer boşsa {_today_tr()} yaz.]
 **Detaylar:** [Sana gönderilen İÇERİK ÖZETİ içindeki gerçek bilgileri 3-5 cümlelik detaylı bir Türkçe haber paragrafına çevir. Uydurma bilgi ekleme. İçerikteki önemli detayları, rakamları ve isimleri mutlaka dahil et.]
 **Kaynak Linki:** [Sana gönderilen "URL" linki, hiçbir html etiketi olmadan direkt çıplak link]
+**Bulunan Arama Motoru:** [KAYNAK ARAMA MOTORU alanını aynen yaz, ör: Google veya DuckDuckGo]
 ---
 {social_section_instruction}
 """

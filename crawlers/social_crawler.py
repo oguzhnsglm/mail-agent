@@ -21,9 +21,22 @@ from typing import List, Dict, Optional
 from bs4 import BeautifulSoup
 
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, BrowserConfig, CacheMode
+from crawlers.browser_helper import (
+    get_browser_config,
+    get_crawler_config,
+    google_search_social_httpx,
+)
 
 from utils.logger import setup_logger
 from config import config
+from crawlers.date_utils import (
+    extract_social_date,
+    extract_date_from_search_result,
+    extract_date_from_google_snippet,
+    mark_unknown_date,
+    is_post_url,
+    is_recent_url,
+)
 
 logger = setup_logger(__name__)
 
@@ -104,74 +117,100 @@ class SocialCrawler:
     #  Platform bazlı arama (Google site: filtresi ile)
     # ------------------------------------------------------------------
     async def _search_platform(self, topic: str, platform_key: str) -> List[Dict]:
-        """Belirli bir platform için Google'da site: filtreli arama yapar."""
+        """Belirli bir platform için DuckDuckGo + Google httpx ile arama yapar.
+        1. DuckDuckGo (headless browser) — birincil kaynak
+        2. Google httpx (sade HTTP) — ek kaynak, bot algılamayı aşar
+        Bulunan URL'leri doğrudan açıp içerik çeker.
+        """
         platform = SOCIAL_PLATFORMS[platform_key]
         results: List[Dict] = []
         seen_urls: set = set()
 
-        # Google arama sorgusu: konu + site filtresi + son 1 gün (qdr:d)
+        today_date = datetime.now().strftime("%m.%d.%Y")
+        # DuckDuckGo için basit sorgu: konu + tarih + site filtresi
         site_filter = platform["site_filter"]
-        raw_query = f"{topic} {site_filter}"
+        raw_query = f"{topic} {today_date} {site_filter}"
         encoded_query = urllib.parse.quote_plus(raw_query)
+        ddg_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
 
-        # qdr:d = son 24 saat, qdr:d2 = son 2 gün, qdr:d3 = son 3 gün
-        recency_param = f"qdr:d{self.recency_days}" if self.recency_days > 1 else "qdr:d"
-        google_url = (
-            f"https://www.google.com/search?q={encoded_query}"
-            f"&tbs={recency_param}&hl=tr&gl=TR&num=10"
-        )
-
-        logger.info(f"[SocialCrawler] {platform['name']} araması: {google_url}")
+        logger.info(f"[SocialCrawler] {platform['name']} DuckDuckGo araması: {raw_query}")
 
         try:
-            browser_config = BrowserConfig(headless=True)
-            crawler_config = CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS,
-                page_timeout=30000,
-                magic=True,
-            )
+            browser_config = get_browser_config()
+            crawler_config = get_crawler_config()
 
             async with AsyncWebCrawler(config=browser_config) as crawler:
-                g_result = await crawler.arun(url=google_url, config=crawler_config)
+                # --- Kaynak 1: DuckDuckGo ---
+                try:
+                    g_result = await crawler.arun(url=ddg_url, config=crawler_config)
+                    if g_result.success and hasattr(g_result, 'html') and g_result.html:
+                        soup = BeautifulSoup(g_result.html, 'html.parser')
+                        for a_tag in soup.find_all('a', href=True):
+                            href = a_tag['href']
+                            if 'uddg=' in href:
+                                href = urllib.parse.unquote(href.split('uddg=')[1].split('&')[0])
+                            if not self._is_valid_platform_url(href, platform):
+                                continue
+                            # Profil sayfalarını atla (sadece gerçek paylaşımlar)
+                            if not is_post_url(href):
+                                logger.info(f"[SocialCrawler] Profil sayfası atlandı: {href[:80]}")
+                                continue
+                            # Snowflake ID ile güncellik kontrolü
+                            recency = is_recent_url(href, max_days=self.recency_days)
+                            if recency is False:
+                                continue  # Kesin eski post
+                            if href in seen_urls:
+                                continue
+                            title = a_tag.get_text(strip=True)
+                            if len(title) < 15:
+                                continue
+                            parent_el = a_tag.find_parent(class_='result') or a_tag.find_parent(class_='web-result')
+                            snippet_date = extract_date_from_search_result(a_tag, parent_el)
+                            if not snippet_date:
+                                snippet_date = extract_social_date("", href)
+                            seen_urls.add(href)
+                            results.append({
+                                "url": href, "title": title,
+                                "date": snippet_date, "platform": platform_key,
+                            })
+                            if len(results) >= self.max_results_per_platform:
+                                break
+                        logger.info(f"[SocialCrawler] DuckDuckGo: {len(results)} sonuç")
+                    else:
+                        logger.warning(f"[SocialCrawler] DuckDuckGo başarısız: {platform['name']}")
+                except Exception as e:
+                    logger.warning(f"[SocialCrawler] DuckDuckGo hatası: {e}")
 
-                if not (g_result.success and hasattr(g_result, 'html') and g_result.html):
-                    logger.warning(f"[SocialCrawler] Google araması başarısız: {platform['name']}")
-                    return results
+                # --- Kaynak 2: Google httpx (bot korumasını aşar) ---
+                if len(results) < self.max_results_per_platform:
+                    try:
+                        google_results = await google_search_social_httpx(
+                            topic, platform=platform_key,
+                            max_results=self.max_results_per_platform - len(results),
+                            recency_days=self.recency_days,
+                        )
+                        for g_item in google_results:
+                            url = g_item["url"]
+                            if not self._is_valid_platform_url(url, platform):
+                                continue
+                            if url in seen_urls:
+                                continue
+                            seen_urls.add(url)
+                            results.append({
+                                "url": url, "title": g_item["title"],
+                                "date": "", "platform": platform_key,
+                            })
+                            if len(results) >= self.max_results_per_platform:
+                                break
+                        logger.info(f"[SocialCrawler] Google httpx ek: toplam {len(results)} sonuç")
+                    except Exception as e:
+                        logger.warning(f"[SocialCrawler] Google httpx hatası: {e}")
 
-                soup = BeautifulSoup(g_result.html, 'html.parser')
+                if not results:
+                    logger.info(f"[SocialCrawler] {platform['name']}: Hiç sonuç bulunamadı")
+                    return []
 
-                for a_tag in soup.find_all('a', href=True):
-                    href = a_tag['href']
-
-                    # Google yönlendirmelerini çöz
-                    if '/url?q=' in href:
-                        href = href.split('/url?q=')[1].split('&')[0]
-                        href = urllib.parse.unquote(href)
-
-                    # Platform URL'sine uyuyor mu kontrol et
-                    if not self._is_valid_platform_url(href, platform):
-                        continue
-
-                    # Daha önce eklendi mi?
-                    if href in seen_urls:
-                        continue
-
-                    title = a_tag.get_text(strip=True)
-                    if len(title) < 15:
-                        continue
-
-                    seen_urls.add(href)
-                    results.append({
-                        "url": href,
-                        "title": title,
-                        "date": datetime.now().strftime("%Y-%m-%d"),
-                        "platform": platform_key,
-                    })
-
-                    if len(results) >= self.max_results_per_platform:
-                        break
-
-                # Bulunan URL'lerin detaylarını çek
+                # Bulunan URL'leri doğrudan açıp içerik çek
                 detailed_articles = []
                 for item in results:
                     try:
@@ -182,7 +221,6 @@ class SocialCrawler:
                             detailed_articles.append(article)
                     except Exception as e:
                         logger.error(f"[SocialCrawler] İçerik çekme hatası ({item['url']}): {e}")
-                        # Fallback: arama sonucundan gelen bilgiyle article oluştur
                         detailed_articles.append(self._create_fallback_article(item, platform, topic))
 
                 logger.info(
@@ -241,12 +279,15 @@ class SocialCrawler:
                 if extracted_title and len(extracted_title) > len(title):
                     title = extracted_title
 
-            # Tarih çıkarmayı dene
-            pub_date = item.get("date", datetime.now().strftime("%Y-%m-%d"))
-            if hasattr(result, 'html') and result.html:
-                extracted_date = self._extract_date_from_social(result.html)
-                if extracted_date:
-                    pub_date = extracted_date
+            # Tarih çıkarmayı dene — date_utils ile kapsamlı çıkarım
+            page_html = result.html if hasattr(result, 'html') else ""
+            extracted_date = extract_social_date(page_html, url)
+            # Öncelik: sayfa içinden çıkarılan > arama snippet'inden gelen > bilinmiyor
+            pub_date = extracted_date or item.get("date", "") or mark_unknown_date()
+            if pub_date:
+                logger.info(f"[SocialCrawler] Tarih bulundu: {pub_date} ({url[:60]})")
+            else:
+                logger.warning(f"[SocialCrawler] Tarih belirlenemedi: {url[:60]}")
 
             return {
                 "title": f"{platform['icon']} {title}",
@@ -309,40 +350,20 @@ class SocialCrawler:
 
         return ""
 
-    def _extract_date_from_social(self, html: str) -> str:
-        """Sosyal medya sayfasından tarih çıkarır."""
-        import dateutil.parser
-
-        soup = BeautifulSoup(html, 'html.parser')
-
-        # time ve datetime etiketlerini kontrol et
-        time_tag = soup.find('time', datetime=True)
-        if time_tag:
-            try:
-                dt = dateutil.parser.parse(time_tag['datetime'], fuzzy=True)
-                return dt.strftime("%Y-%m-%d")
-            except Exception:
-                pass
-
-        # Meta etiketlerinden tarih çıkar
-        for prop in ['article:published_time', 'og:updated_time', 'datePublished']:
-            meta = soup.find('meta', property=prop) or soup.find('meta', attrs={'name': prop})
-            if meta and meta.get('content'):
-                try:
-                    dt = dateutil.parser.parse(meta['content'], fuzzy=True)
-                    return dt.strftime("%Y-%m-%d")
-                except Exception:
-                    pass
-
-        return ""
+    def _extract_date_from_social(self, html: str, url: str = "") -> str:
+        """Sosyal medya sayfasından tarih çıkarır. date_utils modülüne yönlendirir."""
+        return extract_social_date(html, url)
 
     def _create_fallback_article(self, item: Dict, platform: Dict, topic: str) -> Dict:
         """Detaylı içerik çekilemediğinde, arama sonucundan basit bir article oluşturur."""
+        # URL'den platform ID ile tarih çıkarmayı dene
+        url = item.get("url", "")
+        fallback_date = item.get("date", "") or extract_social_date("", url) or mark_unknown_date()
         return {
             "title": f"{platform['icon']} {item.get('title', topic)}",
             "summary": f"{platform['name']} paylaşımı: {item.get('title', '')}",
-            "url": item.get("url", ""),
-            "published_date": item.get("date", datetime.now().strftime("%Y-%m-%d")),
+            "url": url,
+            "published_date": fallback_date,
             "content": f"{platform['name']} paylaşımı: {item.get('title', '')}",
             "topic": topic,
             "source_type": "social_media",

@@ -21,14 +21,16 @@ def setup_logger(name: str = "newsletter_agent") -> logging.Logger:
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # File handler
+    # File handler — UTF-8 encoding for emoji/unicode support
     log_filename = f"logs/newsletter_{datetime.now().strftime('%Y%m%d')}.log"
-    file_handler = logging.FileHandler(log_filename)
+    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
-    
-    # Console handler
-    console_handler = logging.StreamHandler()
+
+    # Console handler — Windows cp1254 Unicode hatalarını önlemek için errors='replace'
+    import sys
+    console_stream = open(sys.stdout.fileno(), mode='w', encoding='utf-8', errors='replace', closefd=False)
+    console_handler = logging.StreamHandler(console_stream)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     

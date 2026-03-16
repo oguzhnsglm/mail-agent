@@ -59,4 +59,12 @@ class Config:
     # Platform başına maksimum sonuç sayısı
     SOCIAL_MAX_RESULTS_PER_PLATFORM = int(os.getenv("SOCIAL_MAX_RESULTS_PER_PLATFORM", "3"))
 
+    # --- Date Range Social Search (Ek Modül) ---
+    # Tarih aralığı tabanlı ek sosyal medya aramasını açıp kapatmak için
+    DATE_RANGE_SEARCH_ENABLED = os.getenv("DATE_RANGE_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes")
+    # Kaç gün geriye bakılacak (varsayılan: 7 gün)
+    DATE_RANGE_DAYS = int(os.getenv("DATE_RANGE_DAYS", "7"))
+    # Tarih aralığı aramasında platform başına maksimum sonuç
+    DATE_RANGE_MAX_PER_PLATFORM = int(os.getenv("DATE_RANGE_MAX_PER_PLATFORM", "5"))
+
 config = Config()

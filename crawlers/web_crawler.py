@@ -21,6 +21,23 @@ import dateutil.parser
 
 from utils.logger import setup_logger
 from config import config
+from crawlers.date_utils import (
+    extract_social_date,
+    extract_date_from_html as date_utils_extract_date_from_html,
+    extract_date_from_search_result,
+    extract_date_from_google_snippet,
+    mark_unknown_date,
+    safe_parse_date,
+    format_date,
+    validate_date,
+)
+from crawlers.social_date_range_crawler import SocialDateRangeCrawler
+from crawlers.browser_helper import (
+    get_browser_config,
+    get_crawler_config,
+    google_search_httpx,
+    google_search_social_httpx,
+)
 
 logger = setup_logger(__name__)
 
@@ -35,6 +52,7 @@ class WebCrawler:
     def __init__(self):
         self.timeout = config.CRAWL_TIMEOUT
         self.max_articles = config.MAX_ARTICLES_PER_TOPIC
+        self.date_range_crawler = SocialDateRangeCrawler()
         
     def _extract_date_from_html(self, html: str) -> str:
         """Makale sayfasından yayın tarihini çıkar. Birden fazla strateji dener."""
@@ -122,12 +140,14 @@ class WebCrawler:
     async def crawl_with_crawl4ai(self, url: str, topic: str, expected_date: str = None, expected_title: str = None) -> List[Dict]:
         """Crawl a single URL using Crawl4AI. If it's a category/list page, dive into ALL real article links."""
         try:
-            browser_config = BrowserConfig(headless=True)
+            browser_config = get_browser_config()
             crawler_config = CrawlerRunConfig(
                 cache_mode=CacheMode.BYPASS,
                 word_count_threshold=10,
                 page_timeout=60000,
-                magic=True
+                magic=True,
+                simulate_user=True,
+                override_navigator=True,
             )
 
             async with AsyncWebCrawler(config=browser_config) as crawler:
@@ -382,12 +402,8 @@ class WebCrawler:
         query = urllib.parse.quote_plus(topic)
         
         try:
-            browser_config = BrowserConfig(headless=True)
-            crawler_config = CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS, 
-                page_timeout=30000,
-                magic=True # Bot korumalarını asmak ve JS'i daha iyi parse etmek için çok önemli
-            )
+            browser_config = get_browser_config()
+            crawler_config = get_crawler_config()
             
             async with AsyncWebCrawler(config=browser_config) as crawler:
 
@@ -402,23 +418,27 @@ class WebCrawler:
                     # Google Search HTML yapısındaki standart a tagları içinden geçerli haber linklerini çıkar
                     for a_tag in soup.find_all('a', href=True):
                         href = a_tag['href']
-                        
+
                         # Google yönlendirmelerini temizle (/url?q=...)
                         if '/url?q=' in href:
                             href = href.split('/url?q=')[1].split('&')[0]
                             href = urllib.parse.unquote(href)
-                            
+
                         # Google iç linkleri değilse ve medya/pdf değilse ekle
                         if href.startswith('http') and not href.startswith('https://google.com') and not href.startswith('https://www.google.com') and not href.startswith('https://support.google.com'):
                             title = a_tag.get_text(strip=True)
-                            
+
                             if len(title) > 20: # Sadece uzun başlığı olan geçerli linkler
                                 if href not in seen:
+                                    # Google snippet'inden tarih çıkarmayı dene
+                                    parent_el = a_tag.find_parent(['div', 'li', 'article'])
+                                    snippet_date = extract_date_from_search_result(a_tag, parent_el)
                                     seen.add(href)
                                     search_results.append({
                                         "url": href,
-                                        "date": datetime.now().strftime("%Y-%m-%d"),
-                                        "title": title
+                                        "date": snippet_date or "",
+                                        "title": title,
+                                        "search_source": "Google"
                                     })
                                     if len(search_results) >= 5: # En iyi 5 sonucu al yeter
                                         break
@@ -437,15 +457,40 @@ class WebCrawler:
                             if "//duckduckgo.com/l/?uddg=" in href:
                                 resolved_url = urllib.parse.unquote(href.split('uddg=')[1].split('&')[0])
                                 if resolved_url not in seen and len(title) > 20:
+                                    # DuckDuckGo snippet'inden tarih çıkar
+                                    parent_el = a_tag.find_parent(class_='result') or a_tag.find_parent(class_='web-result')
+                                    ddg_date = extract_date_from_search_result(a_tag, parent_el)
                                     seen.add(resolved_url)
                                     search_results.append({
                                         "url": resolved_url,
-                                        "date": datetime.now().strftime("%Y-%m-%d"),
-                                        "title": title
+                                        "date": ddg_date or "",
+                                        "title": title,
+                                        "search_source": "DuckDuckGo"
                                     })
                                     
         except Exception as e:
             logger.error(f"Crawl4AI search engine scrape failed: {str(e)}")
+
+        # Google headless + DDG yeterli sonuç vermediyse Google httpx ile dene
+        if len(search_results) < 3:
+            logger.info(f"[News] Headless sonuçlar yetersiz ({len(search_results)}), Google httpx deneniyor...")
+            try:
+                today_date = datetime.now().strftime("%m.%d.%Y")
+                httpx_results = await google_search_httpx(
+                    f"{topic} {today_date} haberler", max_results=5
+                )
+                for item in httpx_results:
+                    if item["url"] not in seen and len(search_results) < 5:
+                        seen.add(item["url"])
+                        search_results.append({
+                            "url": item["url"],
+                            "date": "",
+                            "title": item["title"],
+                            "search_source": "Startpage (Google)"
+                        })
+                logger.info(f"[News] Google httpx ile toplam: {len(search_results)} sonuç")
+            except Exception as e:
+                logger.warning(f"[News] Google httpx hatası: {e}")
 
         # En güncel/önemli ilk 3 haberi seçelim
         final_results = search_results[:3]
@@ -491,12 +536,8 @@ class WebCrawler:
         max_per_platform = getattr(config, 'SOCIAL_MAX_RESULTS_PER_PLATFORM', 3)
 
         try:
-            browser_config = BrowserConfig(headless=True)
-            crawler_config = CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS,
-                page_timeout=30000,
-                magic=True,
-            )
+            browser_config = get_browser_config()
+            crawler_config = get_crawler_config()
 
             async with AsyncWebCrawler(config=browser_config) as crawler:
                 for pinfo in platforms:
@@ -545,15 +586,17 @@ class WebCrawler:
 
                                 # Snippet'ten icerik cikar
                                 content = title
-                                date_str = datetime.now().strftime("%Y-%m-%d")
+                                date_str = ""
                                 parent = a_tag.find_parent(class_='result') or a_tag.find_parent(class_='web-result')
                                 if parent:
                                     snippet_el = parent.select_one('.result__snippet')
                                     if snippet_el:
                                         content = snippet_el.get_text(strip=True)
-                                    date_el = parent.select_one('.result__date')
-                                    if date_el:
-                                        date_str = date_el.get_text(strip=True)
+                                    # Arama snippet'inden tarih çıkar
+                                    date_str = extract_date_from_search_result(a_tag, parent)
+                                # Snippet'ten bulunamazsa URL'deki platform ID'den dene
+                                if not date_str:
+                                    date_str = extract_social_date("", href)
 
                                 seen.add(href)
                                 social_results.append({
@@ -563,6 +606,7 @@ class WebCrawler:
                                     "platform": pinfo["key"],
                                     "source_type": "social_media",
                                     "content": content,
+                                    "search_source": "DuckDuckGo",
                                 })
                                 count += 1
                                 logger.info(f"[Social] [+] #{count}: '{title[:60]}' -> {href[:80]}")
@@ -575,7 +619,35 @@ class WebCrawler:
                         if count >= max_per_platform:
                             break
 
-                    logger.info(f"[Social] {pinfo['name']} toplam: {count}")
+                    # Startpage (Google sonuçları) — her zaman ek kaynak olarak çalışır
+                    # Sorgu formatı: "{konu} {tarih} {platform}" (Google'daki ile aynı)
+                    try:
+                        logger.info(f"[Social] {pinfo['name']}: Startpage (Google) araması başlıyor...")
+                        google_results = await google_search_social_httpx(
+                            topic, platform=pinfo["key"], max_results=max_per_platform,
+                            recency_days=getattr(config, 'SOCIAL_SEARCH_RECENCY_DAYS', 7),
+                        )
+                        sp_count = 0
+                        for g_item in google_results:
+                            if g_item["url"] in seen:
+                                continue
+                            seen.add(g_item["url"])
+                            social_results.append({
+                                "url": g_item["url"],
+                                "date": "",
+                                "title": f"{pinfo['icon']}: {g_item['title']}",
+                                "platform": pinfo["key"],
+                                "source_type": "social_media",
+                                "content": g_item.get("snippet", g_item["title"]),
+                                "search_source": "Startpage (Google)",
+                            })
+                            sp_count += 1
+                            logger.info(f"[Social] [Startpage] #{sp_count}: '{g_item['title'][:60]}' -> {g_item['url'][:80]}")
+                        count += sp_count
+                    except Exception as e:
+                        logger.warning(f"[Social] Startpage hatası: {e}")
+
+                    logger.info(f"[Social] {pinfo['name']} toplam: {count} (DDG + Startpage)")
 
         except Exception as e:
             logger.error(f"[Social] Genel hata: {e}", exc_info=True)
@@ -608,13 +680,18 @@ class WebCrawler:
 
             crawl_results = await asyncio.gather(*crawl_tasks, return_exceptions=True)
 
-            for result in crawl_results:
+            for idx, result in enumerate(crawl_results):
                 if isinstance(result, list):
+                    # Kaynak bilgisini ekle
+                    source = search_urls[idx].get("search_source", "") if idx < len(search_urls) else ""
+                    for article in result:
+                        if source:
+                            article["search_source"] = source
                     all_articles.extend(result)
                 elif isinstance(result, Exception):
                     logger.error(f"Crawling task failed: {str(result)}")
 
-        # 2. Sosyal medya araması (LinkedIn + Twitter/X)
+        # 2. Sosyal medya araması (LinkedIn + Twitter/X) — mevcut yapı
         try:
             social_urls = await self.search_social_urls(topic)
             if social_urls:
@@ -624,6 +701,19 @@ class WebCrawler:
                 logger.info(f"Added {len(social_articles)} social media articles for {topic}")
         except Exception as e:
             logger.error(f"Social media search failed for {topic}: {e}")
+
+        # 3. Tarih aralığı tabanlı ek sosyal medya araması (yeni modül)
+        try:
+            date_range_articles = await self.date_range_crawler.fetch_date_range_social(topic)
+            if date_range_articles:
+                # Aynı URL'leri tekrar eklememek için dedup yap
+                existing_urls = {a.get('url', '') for a in all_articles}
+                new_articles = [a for a in date_range_articles if a.get('url', '') not in existing_urls]
+                all_articles.extend(new_articles)
+                logger.info(f"[DateRange] Added {len(new_articles)} new social articles for {topic} "
+                           f"({len(date_range_articles) - len(new_articles)} duplicates skipped)")
+        except Exception as e:
+            logger.error(f"Date range social search failed for {topic}: {e}")
 
         # Tarih filtresi: çok eski içerikleri ele
         all_articles = self._filter_by_recency(all_articles)
@@ -657,12 +747,8 @@ class WebCrawler:
         logger.info(f"[Social] {len(profile_items)} profil, {len(post_items)} dogrudan post")
 
         try:
-            browser_config = BrowserConfig(headless=True)
-            crawler_config = CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS,
-                page_timeout=30000,
-                magic=True,
-            )
+            browser_config = get_browser_config()
+            crawler_config = get_crawler_config()
 
             async with AsyncWebCrawler(config=browser_config) as crawler:
                 # 1. Profil sayfaları için Google'da son postları ara
@@ -843,7 +929,7 @@ class WebCrawler:
                 post_result = await crawler.arun(url=post_info["url"], config=crawler_config)
                 if post_result.success and hasattr(post_result, 'html') and post_result.html:
                     post_content = self._extract_meta_content(post_result.html)
-                    pub_date = self._extract_date_from_html(post_result.html) or datetime.now().strftime("%Y-%m-%d")
+                    pub_date = extract_social_date(post_result.html, post_info["url"]) or mark_unknown_date()
                     if post_content and len(post_content) > 30:
                         posts.append({
                             "title": post_info["title"],
@@ -854,20 +940,23 @@ class WebCrawler:
                             "topic": topic,
                             "source_type": "social_media",
                             "platform": platform,
+                            "search_source": item.get("search_source", ""),
                         })
-                        logger.info(f"[Social] Post içeriği çekildi: {post_info['title'][:60]}")
+                        logger.info(f"[Social] Post içeriği çekildi ({pub_date}): {post_info['title'][:60]}")
                         continue
 
-                # Meta tag'den çekemediyse başlıkla ekle
+                # Meta tag'den çekemediyse URL ID'den tarih dene
+                id_date = extract_social_date("", post_info["url"]) or mark_unknown_date()
                 posts.append({
                     "title": post_info["title"],
                     "summary": post_info["title"],
                     "url": post_info["url"],
-                    "published_date": datetime.now().strftime("%Y-%m-%d"),
+                    "published_date": id_date,
                     "content": post_info["title"],
                     "topic": topic,
                     "source_type": "social_media",
                     "platform": platform,
+                    "search_source": item.get("search_source", ""),
                 })
             except Exception as e:
                 logger.error(f"[Social] Post içerik çekme hatası: {e}")
@@ -912,15 +1001,17 @@ class WebCrawler:
             if result.success and hasattr(result, 'html') and result.html:
                 content = self._extract_meta_content(result.html)
                 if content and len(content) > 30:
+                    pub_date = extract_social_date(result.html, url) or item.get("date", "") or mark_unknown_date()
                     return {
                         "title": item.get("title", topic),
                         "summary": content,
                         "url": url,
-                        "published_date": item.get("date", datetime.now().strftime("%Y-%m-%d")),
+                        "published_date": pub_date,
                         "content": content,
                         "topic": topic,
                         "source_type": "social_media",
                         "platform": platform,
+                        "search_source": item.get("search_source", ""),
                     }
         except Exception as e:
             logger.error(f"[Social] Post fetch hatası ({url}): {e}")
@@ -945,6 +1036,10 @@ class WebCrawler:
 
         # Markdown içerikten de deneyebiliriz
         return title_content
+
+    def _extract_social_date(self, html: str, url: str) -> str:
+        """Sosyal medya postunun gerçek tarihini çıkarır. date_utils modülüne yönlendirir."""
+        return extract_social_date(html, url)
 
     def _filter_by_recency(self, articles: List[Dict], max_age_days: int = 30) -> List[Dict]:
         """Tarih bilgisi olan makaleleri kontrol eder, çok eski olanları eler.
@@ -973,15 +1068,18 @@ class WebCrawler:
 
     def _social_fallback(self, item: Dict, topic: str) -> Dict:
         """Sosyal medya sonucunu sadece başlık bilgisiyle article olarak döndürür."""
+        url = item.get("url", "")
+        fallback_date = item.get("date", "") or extract_social_date("", url) or mark_unknown_date()
         return {
             "title": item.get("title", topic),
             "summary": item.get("content", item.get("title", "")),
-            "url": item.get("url", ""),
-            "published_date": item.get("date", datetime.now().strftime("%Y-%m-%d")),
+            "url": url,
+            "published_date": fallback_date,
             "content": item.get("content", item.get("title", "")),
             "topic": topic,
             "source_type": "social_media",
             "platform": item.get("platform", "unknown"),
+            "search_source": item.get("search_source", ""),
         }
 
     def _parse_llm_extraction(self, extracted_content: str, source_url: str, topic: str) -> List[Dict]:
