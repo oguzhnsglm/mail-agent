@@ -8,13 +8,29 @@ logger = setup_logger(__name__)
 class OpenRouterClient:
     def __init__(self):
         self.api_key = config.OPENROUTER_API_KEY
-        self.base_url = config.OPENROUTER_BASE_URL
+        self.base_url = (config.OPENROUTER_BASE_URL or "").rstrip("/")
         self.default_model = config.DEFAULT_MODEL
         self.temperature = config.TEMPERATURE
         self.max_tokens = config.MAX_TOKENS
         
         if not self.api_key:
             raise ValueError("OpenRouter API key not found in configuration")
+
+    def _normalized_model(self, model: str) -> str:
+        model = (model or "").strip()
+        if not model:
+            return model
+
+        # gpt-5.4 is not a valid public model id for OpenAI/OpenRouter chat completions.
+        if model == "gpt-5.4":
+            logger.warning("Invalid model id 'gpt-5.4' detected; switching to 'gpt-5.2'")
+            model = "gpt-5.2"
+
+        # If the endpoint is OpenAI, provider prefixes like openai/gpt-5 are invalid.
+        if "api.openai.com" in self.base_url and "/" in model:
+            model = model.split("/", 1)[1]
+
+        return model
     
     def generate_completion(
         self, 
@@ -38,16 +54,23 @@ class OpenRouterClient:
             messages.append({"role": "system", "content": system_message})
         messages.append({"role": "user", "content": prompt})
         
+        resolved_model = self._normalized_model(model or self.default_model)
+        resolved_max_tokens = self.max_tokens if max_tokens is None else max_tokens
+
         payload = {
-            "model": model or self.default_model,
+            "model": resolved_model,
             "messages": messages,
-            "temperature": temperature or self.temperature,
-            "max_tokens": max_tokens or self.max_tokens
+            "temperature": self.temperature if temperature is None else temperature,
         }
-        
+        if resolved_model.startswith("gpt-5"):
+            payload["max_completion_tokens"] = resolved_max_tokens
+        else:
+            payload["max_tokens"] = resolved_max_tokens
+
         try:
+            request_url = f"{self.base_url}/chat/completions"
             response = requests.post(
-                f"{self.base_url}/chat/completions",
+                request_url,
                 json=payload,
                 headers=headers,
                 timeout=180
@@ -61,9 +84,19 @@ class OpenRouterClient:
             else:
                 logger.error(f"Unexpected response format: {result}")
                 return ""
-                
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else "unknown"
+            response_text = (e.response.text or "")[:1200] if e.response is not None else ""
+            logger.error(
+                f"LLM API HTTP error | status={status_code} | model={payload.get('model')} | "
+                f"url={request_url} | response={response_text}"
+            )
+            return ""
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error calling OpenRouter API: {str(e)}")
+            logger.error(
+                f"Error calling OpenRouter API | model={payload.get('model')} | "
+                f"url={request_url} | error={str(e)}"
+            )
             return ""
         except Exception as e:
             logger.error(f"Unexpected error in LLM completion: {str(e)}")

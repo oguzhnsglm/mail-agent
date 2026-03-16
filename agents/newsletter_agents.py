@@ -147,7 +147,10 @@ Subject Line: [{_today_tr()} - {topic} Haberleri]
                 temperature=0.1
             )
             state["final_newsletter"] = final_newsletter.strip()
-            logger.info("Editor agent correctly formatted text.")
+            if state["final_newsletter"]:
+                logger.info("Editor agent correctly formatted text.")
+            else:
+                logger.error("Editor agent returned empty text from LLM.")
         except Exception as e:
             logger.error(f"Error in LLM completion: {e}")
             state["final_newsletter"] = f"Mail içeriği oluşturulamadı: {str(e)}"
@@ -165,7 +168,10 @@ Subject Line: [{_today_tr()} - {topic} Haberleri]
         
         try:
             final_state = self.graph.invoke(initial_state)
-            logger.info("Agent workflow completed successfully")
+            if final_state.get("final_newsletter"):
+                logger.info("Agent workflow completed successfully")
+            else:
+                logger.error("Agent workflow completed but final_newsletter is empty")
             return final_state
         except Exception as e:
             logger.error(f"Error in agent workflow: {str(e)}")

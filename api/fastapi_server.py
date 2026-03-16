@@ -15,6 +15,7 @@ nest_asyncio.apply()
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from pydantic import BaseModel
 from typing import List, Optional, Dict
@@ -32,6 +33,14 @@ app = FastAPI(
     title="Günlük Haber Bülteni API",
     description="Herhangi bir konuda en güncel haberleri toplayıp e-posta ile gönderen servis",
     version="2.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 scheduler = NewsletterScheduler()

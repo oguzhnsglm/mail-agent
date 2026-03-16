@@ -26,9 +26,9 @@ class Config:
     CRAWL_TIMEOUT = int(os.getenv("CRAWL_TIMEOUT", "30"))
     
     # LLM Configuration
-    DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4-turbo-preview")
-    TEMPERATURE = float(os.getenv("TEMPERATURE", "0.7"))
-    MAX_TOKENS = int(os.getenv("MAX_TOKENS", "3000"))
+    DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5.2")
+    TEMPERATURE = float(os.getenv("TEMPERATURE", "0.8"))
+    MAX_TOKENS = int(os.getenv("MAX_TOKENS", "5000"))
     
     # Topics to crawl  –  .env'den virgülle ayırarak istediğiniz konuları yazabilirsiniz
     # Örn: TOPICS="FNSS savunma,Türkiye ekonomi,yapay zeka"
