@@ -1043,15 +1043,24 @@ class WebCrawler:
 
     def _filter_by_recency(self, articles: List[Dict], max_age_days: int = 30) -> List[Dict]:
         """Tarih bilgisi olan makaleleri kontrol eder, çok eski olanları eler.
-        Tarih bilgisi olmayan veya parse edilemeyen makaleler korunur.
+        Web haberleri: Tarih bilgisi olmayan veya parse edilemeyen makaleler korunur.
+        Sosyal medya: Tarih bilgisi olmayan makaleler ELENIR (tarihsiz sosyal medya güvenilmez).
         """
         cutoff = datetime.now() - timedelta(days=max_age_days)
         filtered = []
         for article in articles:
             pub_date_str = article.get("published_date", "")
+            is_social = article.get("source_type") == "social_media"
+
             if not pub_date_str:
-                filtered.append(article)
-                continue
+                if is_social:
+                    # Sosyal medya tarihsiz ise dahil etme
+                    logger.info(f"[Recency] Tarihsiz sosyal medya elendi: {article.get('title', '')[:60]}")
+                    continue
+                else:
+                    # Web haberleri tarihsiz olabilir
+                    filtered.append(article)
+                    continue
             try:
                 pub_date = dateutil.parser.parse(pub_date_str, fuzzy=True)
                 if pub_date.tzinfo:
@@ -1061,6 +1070,9 @@ class WebCrawler:
                 else:
                     logger.info(f"[Recency] Eski icerik elendi: {article.get('title', '')[:60]} ({pub_date_str})")
             except Exception:
+                if is_social:
+                    logger.info(f"[Recency] Tarih parse edilemedi, sosyal medya elendi: {article.get('title', '')[:60]}")
+                    continue
                 filtered.append(article)
         if len(filtered) < len(articles):
             logger.info(f"[Recency] {len(articles) - len(filtered)} eski icerik elendi, kalan: {len(filtered)}")

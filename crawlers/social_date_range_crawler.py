@@ -188,7 +188,9 @@ class SocialDateRangeCrawler:
                             results.append(article)
                     except Exception as e:
                         logger.error(f"[DateRange] İçerik çekme hatası ({item['url']}): {e}")
-                        results.append(self._create_fallback(item, platform, topic))
+                        fallback = self._create_fallback(item, platform, topic)
+                        if fallback:
+                            results.append(fallback)
 
             logger.info(f"[DateRange] {platform['name']}: {len(results)} sonuç tamamlandı")
 
@@ -250,13 +252,28 @@ class SocialDateRangeCrawler:
 
             # Tarih çıkarma — kapsamlı (date_utils)
             extracted_date = extract_social_date(page_html, url)
-            # Öncelik: sayfa HTML > arama snippet > URL ID > bilinmiyor
-            pub_date = extracted_date or item.get("date", "") or mark_unknown_date()
+            pub_date = extracted_date or item.get("date", "")
 
-            if pub_date:
-                logger.info(f"[DateRange] Tarih: {pub_date} | {title[:50]}")
-            else:
-                logger.warning(f"[DateRange] Tarih belirlenemedi: {url[:60]}")
+            # Tarih bulunamadıysa bu paylaşımı atla
+            if not pub_date:
+                logger.warning(f"[DateRange] Tarih belirlenemedi, atlanıyor: {url[:80]}")
+                return None
+
+            # Tarih çok eskiyse atla
+            try:
+                dt = safe_parse_date(pub_date)
+                if dt:
+                    age_days = (datetime.now() - dt).days
+                    if age_days > self.range_days:
+                        logger.info(f"[DateRange] Eski paylaşım ({age_days} gün), atlanıyor: {url[:80]}")
+                        return None
+                    logger.info(f"[DateRange] Tarih: {pub_date} ({age_days} gün) — {title[:50]}")
+                else:
+                    logger.warning(f"[DateRange] Tarih parse edilemedi, atlanıyor: {pub_date} — {url[:80]}")
+                    return None
+            except Exception:
+                logger.warning(f"[DateRange] Tarih doğrulanamadı, atlanıyor: {url[:80]}")
+                return None
 
             return {
                 "title": f"{platform['icon']} {title}",
@@ -305,10 +322,28 @@ class SocialDateRangeCrawler:
 
         return ""
 
-    def _create_fallback(self, item: Dict, platform: Dict, topic: str) -> Dict:
-        """Detaylı içerik çekilemediğinde fallback article oluşturur."""
+    def _create_fallback(self, item: Dict, platform: Dict, topic: str) -> Optional[Dict]:
+        """Detaylı içerik çekilemediğinde fallback article oluşturur.
+        Tarih bulunamazsa veya eskiyse None döner.
+        """
         url = item.get("url", "")
-        fallback_date = item.get("date", "") or extract_social_date("", url) or mark_unknown_date()
+        fallback_date = item.get("date", "") or extract_social_date("", url)
+
+        if not fallback_date:
+            logger.warning(f"[DateRange] Fallback: tarih yok, atlanıyor: {url[:80]}")
+            return None
+
+        # Tarih çok eskiyse atla
+        try:
+            dt = safe_parse_date(fallback_date)
+            if dt:
+                age_days = (datetime.now() - dt).days
+                if age_days > self.range_days:
+                    logger.info(f"[DateRange] Fallback: eski paylaşım ({age_days} gün), atlanıyor: {url[:80]}")
+                    return None
+        except Exception:
+            pass
+
         return {
             "title": f"{platform['icon']} {item.get('title', topic)}",
             "summary": f"{platform['name']} paylaşımı: {item.get('title', '')}",

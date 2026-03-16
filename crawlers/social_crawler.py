@@ -221,7 +221,9 @@ class SocialCrawler:
                             detailed_articles.append(article)
                     except Exception as e:
                         logger.error(f"[SocialCrawler] İçerik çekme hatası ({item['url']}): {e}")
-                        detailed_articles.append(self._create_fallback_article(item, platform, topic))
+                        fallback = self._create_fallback_article(item, platform, topic)
+                        if fallback:
+                            detailed_articles.append(fallback)
 
                 logger.info(
                     f"[SocialCrawler] {platform['name']}: {len(detailed_articles)} sonuç çekildi"
@@ -282,12 +284,30 @@ class SocialCrawler:
             # Tarih çıkarmayı dene — date_utils ile kapsamlı çıkarım
             page_html = result.html if hasattr(result, 'html') else ""
             extracted_date = extract_social_date(page_html, url)
-            # Öncelik: sayfa içinden çıkarılan > arama snippet'inden gelen > bilinmiyor
-            pub_date = extracted_date or item.get("date", "") or mark_unknown_date()
-            if pub_date:
-                logger.info(f"[SocialCrawler] Tarih bulundu: {pub_date} ({url[:60]})")
-            else:
-                logger.warning(f"[SocialCrawler] Tarih belirlenemedi: {url[:60]}")
+            # Öncelik: sayfa içinden çıkarılan > arama snippet'inden gelen
+            pub_date = extracted_date or item.get("date", "")
+
+            # Tarih bulunamadıysa bu paylaşımı atla
+            if not pub_date:
+                logger.warning(f"[SocialCrawler] Tarih belirlenemedi, atlanıyor: {url[:80]}")
+                return None
+
+            # Tarih çok eskiyse atla (recency_days config'den)
+            try:
+                from crawlers.date_utils import safe_parse_date
+                dt = safe_parse_date(pub_date)
+                if dt:
+                    age_days = (datetime.now() - dt).days
+                    if age_days > self.recency_days:
+                        logger.info(f"[SocialCrawler] Eski paylaşım atlanıyor ({age_days} gün): {url[:80]}")
+                        return None
+                    logger.info(f"[SocialCrawler] Tarih: {pub_date} ({age_days} gün) — {url[:60]}")
+                else:
+                    logger.warning(f"[SocialCrawler] Tarih parse edilemedi, atlanıyor: {pub_date} — {url[:80]}")
+                    return None
+            except Exception:
+                logger.warning(f"[SocialCrawler] Tarih doğrulanamadı, atlanıyor: {url[:80]}")
+                return None
 
             return {
                 "title": f"{platform['icon']} {title}",
@@ -354,11 +374,30 @@ class SocialCrawler:
         """Sosyal medya sayfasından tarih çıkarır. date_utils modülüne yönlendirir."""
         return extract_social_date(html, url)
 
-    def _create_fallback_article(self, item: Dict, platform: Dict, topic: str) -> Dict:
-        """Detaylı içerik çekilemediğinde, arama sonucundan basit bir article oluşturur."""
-        # URL'den platform ID ile tarih çıkarmayı dene
+    def _create_fallback_article(self, item: Dict, platform: Dict, topic: str) -> Optional[Dict]:
+        """Detaylı içerik çekilemediğinde, arama sonucundan basit bir article oluşturur.
+        Tarih bulunamazsa None döner (tarihsiz sosyal medya makalesi dahil edilmez).
+        """
         url = item.get("url", "")
-        fallback_date = item.get("date", "") or extract_social_date("", url) or mark_unknown_date()
+        fallback_date = item.get("date", "") or extract_social_date("", url)
+
+        # Tarih bulunamadıysa fallback da oluşturma
+        if not fallback_date:
+            logger.warning(f"[SocialCrawler] Fallback: tarih yok, atlanıyor: {url[:80]}")
+            return None
+
+        # Tarih çok eskiyse atla
+        try:
+            from crawlers.date_utils import safe_parse_date
+            dt = safe_parse_date(fallback_date)
+            if dt:
+                age_days = (datetime.now() - dt).days
+                if age_days > self.recency_days:
+                    logger.info(f"[SocialCrawler] Fallback: eski paylaşım ({age_days} gün), atlanıyor: {url[:80]}")
+                    return None
+        except Exception:
+            pass
+
         return {
             "title": f"{platform['icon']} {item.get('title', topic)}",
             "summary": f"{platform['name']} paylaşımı: {item.get('title', '')}",
